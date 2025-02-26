@@ -44,6 +44,10 @@ def get_device_flops(unit="T"):
         flops = 148e12
     elif "910B" in device_name:
         flops = 354e12
+    elif "4000" in device_name:
+        flops = 26.73e12
+    elif "4090" in device_name:
+        flops = 82.58e12
     flops_unit = unit_convert(flops, unit)
     return flops_unit
 
@@ -68,6 +72,131 @@ class FlopsCounter:
 
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time):
         return 0
+
+    def estimate_flops_critic(self, prompt, output, delta_time):
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        intermediate_size = self.config.intermediate_size
+
+        head_dim = hidden_size // num_attention_heads
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        prefill_estimated_flops = 0
+        for idx, (i,j) in enumerate(zip(prompt, output)):
+            prefill_estimated_flops += 24 * num_hidden_layers * hidden_size ** 2 * (i+j)\
+            + 4 * num_hidden_layers * hidden_size * (i+j)**2 \
+            + 2 * (i+j) * hidden_size * vocab_size
+
+        estimated_flops = prefill_estimated_flops
+        unit_estimated_flops = estimated_flops * (1.0 / delta_time) / 1e12
+        promised_flops = get_device_flops()
+        return unit_estimated_flops, promised_flops, estimated_flops
+
+    def estimate_flops_reward(self, prompt, output, delta_time):
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        intermediate_size = self.config.intermediate_size
+
+        head_dim = hidden_size // num_attention_heads
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        prefill_estimated_flops = 0
+        for idx, (i,j) in enumerate(zip(prompt, output)):
+            prefill_estimated_flops += 24 * num_hidden_layers * hidden_size ** 2 * (i+j)\
+            + 4 * num_hidden_layers * hidden_size * (i+j)**2 \
+            + 2 * (i+j) * hidden_size * vocab_size
+
+        estimated_flops = prefill_estimated_flops
+        unit_estimated_flops = estimated_flops * (1.0 / delta_time) / 1e12
+        promised_flops = get_device_flops()
+        return unit_estimated_flops, promised_flops, estimated_flops
+
+    def estimate_flops_ref(self, prompt, output, delta_time):
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        intermediate_size = self.config.intermediate_size
+
+        head_dim = hidden_size // num_attention_heads
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        prefill_estimated_flops = 0
+        for idx, (i,j) in enumerate(zip(prompt, output)):
+            prefill_estimated_flops += 24 * num_hidden_layers * hidden_size ** 2 * (i+j)\
+            + 4 * num_hidden_layers * hidden_size * (i+j)**2 \
+            + 2 * (i+j) * hidden_size * vocab_size
+
+        estimated_flops = prefill_estimated_flops
+        unit_estimated_flops = estimated_flops * (1.0 / delta_time) / 1e12
+        promised_flops = get_device_flops()
+        return unit_estimated_flops, promised_flops, estimated_flops
+
+    def estimate_flops_rollout_logprob(self, prompt, output, delta_time):
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        intermediate_size = self.config.intermediate_size
+
+        head_dim = hidden_size // num_attention_heads
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        prefill_estimated_flops = 0
+        for idx, (i,j) in enumerate(zip(prompt, output)):
+            prefill_estimated_flops += 24 * num_hidden_layers * hidden_size ** 2 * (i+j)\
+            + 4 * num_hidden_layers * hidden_size * (i+j)**2 \
+            + 2 * (i+j) * hidden_size * vocab_size
+
+        estimated_flops = prefill_estimated_flops
+        unit_estimated_flops = estimated_flops * (1.0 / delta_time) / 1e12
+        promised_flops = get_device_flops()
+        return unit_estimated_flops, promised_flops, estimated_flops
+
+    def estimate_flops_rollout(self, prompt, output, delta_time):
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        intermediate_size = self.config.intermediate_size
+
+        head_dim = hidden_size // num_attention_heads
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        prefill_estimated_flops = 0
+        for idx, i in enumerate(prompt):
+            prefill_estimated_flops += 24 * num_hidden_layers * hidden_size ** 2 * i\
+            + 4 * num_hidden_layers * hidden_size * i**2 \
+            + 2 * i * hidden_size * vocab_size
+        
+        decode_estimated_flops = 0
+        for idx, (i,j) in enumerate(zip(prompt, output)):
+            decode_estimated_flops += 24 * num_hidden_layers * hidden_size ** 2 * j\
+            + 4 * num_hidden_layers * hidden_size * (2*i+1+j)*j/2 \
+            + 2 * i * hidden_size * vocab_size
+        estimated_flops = prefill_estimated_flops + decode_estimated_flops
+        unit_estimated_flops = estimated_flops * (1.0 / delta_time) / 1e12
+        promised_flops = get_device_flops()
+        return unit_estimated_flops, promised_flops, estimated_flops
 
     def _estimate_qwen2_flops(self, tokens_sum, batch_seqlens, delta_time):
         assert isinstance(self.config, (Qwen2Config, LlamaConfig))

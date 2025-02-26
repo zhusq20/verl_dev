@@ -402,7 +402,11 @@ class ActorRolloutRefWorker(Worker):
                                                             optimizer=self.actor.actor_optimizer,
                                                             lr_scheduler=self.actor_lr_scheduler,
                                                             tokenizer=self.tokenizer)
-
+        else:
+            from transformers import AutoModelForCausalLM, AutoConfig
+            local_path = copy_local_path_from_hdfs(self.config.model.path)
+            ref_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=True)
+            self.flops_counter = FlopsCounter(ref_model_config)
         torch.cuda.empty_cache()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -585,6 +589,22 @@ class ActorRolloutRefWorker(Worker):
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def count_flops_rollout(self, prompt_length, response_length, delta_time):
+        a,b,c = self.flops_counter.estimate_flops_rollout(prompt_length, response_length, delta_time)
+        return a, b, c
+         
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def count_flops_ref(self, prompt_length, response_length, delta_time):
+        a,b,c= self.flops_counter.estimate_flops_ref(prompt_length, response_length, delta_time)
+        return a, b, c
+
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def count_flops_rollout_logprob(self, prompt_length, response_length, delta_time):
+        a,b,c= self.flops_counter.estimate_flops_rollout_logprob(prompt_length, response_length, delta_time)
+        return a, b, c
 
 class CriticWorker(Worker):
 
@@ -864,6 +884,11 @@ class CriticWorker(Worker):
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def count_flops_critic(self, prompt_length, response_length, delta_time):
+        a,b,c= self.flops_counter.estimate_flops_critic(prompt_length, response_length, delta_time)
+        return a, b, c
+
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py
 class RewardModelWorker(Worker):
@@ -1141,3 +1166,8 @@ class RewardModelWorker(Worker):
         output = output.to('cpu')
         torch.cuda.empty_cache()
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def count_flops_reward(self, prompt, response, delta_time: float):
+        a,b,c= self.flops_counter.estimate_flops_reward(prompt, response, delta_time)
+        return a,b,c
