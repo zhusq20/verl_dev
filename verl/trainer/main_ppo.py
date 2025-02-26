@@ -18,7 +18,7 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
 import ray
 import hydra
-
+import torch
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
 def main(config):
@@ -124,7 +124,6 @@ def main_task(config, compute_score=None):
                             val_reward_fn=val_reward_fn)
     trainer.init_workers()
     trainer.fit()
-
 
 if __name__ == '__main__':
     main()

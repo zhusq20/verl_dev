@@ -18,6 +18,11 @@ tensorflow/my_graph/*
 # C extensions
 *.so
 
+#nsys
+*.qdrep
+*.sqlite
+*.nsys-rep
+*.json
 # Distribution / packaging
 .Python
 env/
