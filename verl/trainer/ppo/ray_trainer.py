@@ -854,7 +854,6 @@ class RayPPOTrainer(object):
                     # generate a batch
                     with _timer('gen', timing_raw):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        # print("gen_batch_output.keys()", gen_batch_output.batch.keys())
 
                     if self.config.algorithm.adv_estimator == 'remax':
                         with _timer('gen_max', timing_raw):
@@ -967,7 +966,7 @@ class RayPPOTrainer(object):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
-                    # total_ops += metrics['mfu/critic'] / self.critic_wg.config.ppo_epochs * promised_flops * self.critic_wg.world_size
+                    total_ops += metrics['mfu/critic'] / self.critic_wg.config.ppo_epochs * promised_flops * self.critic_wg.world_size
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -976,7 +975,7 @@ class RayPPOTrainer(object):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
-                    # total_ops += metrics['mfu/actor'] / self.actor_rollout_wg.config.ppo_epochs * promised_flops * self.actor_rollout_wg.world_size
+                    total_ops += metrics['mfu/actor'] / self.actor_rollout_wg.config.ppo_epochs * promised_flops * self.actor_rollout_wg.world_size
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
@@ -993,8 +992,10 @@ class RayPPOTrainer(object):
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # metrics['total_ops'] = total_ops
-                # metrics['mfu/all'] = total_ops / promised_flops / self.actor_rollout_wg.world_size
+                metrics['total_ops'] = total_ops
+
+                #假设每个模型都占满所有gpu
+                metrics['mfu/all'] = total_ops * (1/timing_raw['step']) / 1e12 / promised_flops / self.actor_rollout_wg.world_size
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
