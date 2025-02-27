@@ -273,6 +273,13 @@ def compute_data_metrics(batch, use_critic=True):
             torch.min(response_length).detach().item(),
         'response_length/clip_ratio':
             torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
+            
+        'response_length/0.2_ranking':
+            torch.quantile(response_length, 0.8).item(),
+        'response_length/0.5_ranking':
+            torch.quantile(response_length, 0.5).item(),
+        'response_length/0.75_ranking':
+            torch.quantile(response_length, 0.25).item(),
         # prompt length
         'prompt_length/mean':
             torch.mean(prompt_length).detach().item(),
