@@ -73,15 +73,28 @@ def main_task(config, compute_score=None):
         Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
     }
 
-    global_pool_id = 'global_pool'
+    actor_pool_id= 'actor_pool_id'
+    other_pool_id = 'other_pool'
     resource_pool_spec = {
-        global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+    actor_pool_id: [2],
+    other_pool_id: [2]
     }
+    
     mapping = {
-        Role.ActorRollout: global_pool_id,
-        Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
+    Role.ActorRollout: actor_pool_id,
+    Role.Critic: other_pool_id,
+    Role.RefPolicy: other_pool_id,
     }
+
+    # global_pool_id = 'global_pool'
+    # resource_pool_spec = {
+    #     global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+    # }
+    # mapping = {
+    #     Role.ActorRollout: global_pool_id,
+    #     Role.Critic: global_pool_id,
+    #     Role.RefPolicy: global_pool_id,
+    # }
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score

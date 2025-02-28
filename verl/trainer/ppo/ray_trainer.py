@@ -837,9 +837,20 @@ class RayPPOTrainer(object):
 
         # we start from step 1
         self.global_steps += 1
-
+        # prof = torch.profiler.profile(
+        #         activities=[
+        #             torch.profiler.ProfilerActivity.CPU,
+        #             torch.profiler.ProfilerActivity.CUDA,
+        #             ],
+        #         on_trace_ready=torch.profiler.tensorboard_trace_handler('/workspace/verlpy310/log/grpo_0228'),
+        #         record_shapes=True,
+        #         profile_memory=True,
+        #         with_stack=True,
+        #         with_flops=True
+        # )
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                
                 metrics = {}
                 timing_raw = {}
                 total_ops = 0
@@ -853,7 +864,10 @@ class RayPPOTrainer(object):
                     
                     # generate a batch
                     with _timer('gen', timing_raw):
+                        # prof.start()
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        # prof.step()
+                        # prof.stop()
 
                     if self.config.algorithm.adv_estimator == 'remax':
                         with _timer('gen_max', timing_raw):
@@ -881,7 +895,7 @@ class RayPPOTrainer(object):
                     prompt_length = response_info['prompt_length']
                     response_length = response_info['response_length']
                     # print(f'prompt_length: {prompt_length}')
-                    result = self.actor_rollout_wg.count_flops_rollout(prompt_length, response_length, timing_raw['gen'])
+                    result = self.actor_rollout_wg.count_flops_rollout(prompt_length, response_length, batch.meta_info["rollout_time"])
                     # print("resultlol",result)
                     estimated_flops, promised_flops, tmp_ops = result[0]
                     metrics.update({"mfu/rollout":estimated_flops / promised_flops / self.actor_rollout_wg.world_size})  
@@ -901,6 +915,7 @@ class RayPPOTrainer(object):
                         batch = batch.union(old_log_prob)
                     '''这里flops怎么算?'''
                     # step_flops, _ = self.actor_rollout_wg.count_flops_rollout(prompt_length, response_length, timing_raw['old_log_prob']) 
+                    
                     estimated_flops, promised_flops, tmp_ops = self.actor_rollout_wg.count_flops_rollout_logprob(prompt_length, response_length, timing_raw['old_log_prob'])[0]
                     metrics.update({"mfu/rollout_logp":estimated_flops / promised_flops / self.actor_rollout_wg.world_size})   
                     total_ops += tmp_ops 
@@ -911,9 +926,9 @@ class RayPPOTrainer(object):
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
                     # step_flops += self.ref_policy_wg.count_flops_ref(prompt_length, response_length, timing_raw['ref'])
-                    estimated_flops, promised_flops, tmp_ops = self.ref_policy_wg.count_flops_ref(prompt_length, response_length, timing_raw['ref'])[0]
-                    metrics.update({"mfu/ref":estimated_flops / promised_flops / self.ref_policy_wg.world_size})   
-                    total_ops += tmp_ops 
+                        estimated_flops, promised_flops, tmp_ops = self.ref_policy_wg.count_flops_ref(prompt_length, response_length, timing_raw['ref'])[0]
+                        metrics.update({"mfu/ref":estimated_flops / promised_flops / self.ref_policy_wg.world_size})   
+                        total_ops += tmp_ops 
 
                     # compute values
                     if self.use_critic:
@@ -921,7 +936,7 @@ class RayPPOTrainer(object):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
                         # step_flops += self.critic_wg.count_flops_critic(prompt_length, response_length, timing_raw['values'])
-                        estimated_flops, promised_flops, tmp_ops = self.critic_wg.count_flops_ref(prompt_length, response_length, timing_raw['critic'])[0]
+                        estimated_flops, promised_flops, tmp_ops = self.critic_wg.count_flops_critic(prompt_length, response_length, timing_raw['values'])[0]
                         metrics.update({"mfu/critic":estimated_flops / promised_flops / self.critic_wg.world_size})   
                         total_ops += tmp_ops 
                     
@@ -964,19 +979,28 @@ class RayPPOTrainer(object):
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
-                        metrics.update(critic_output_metrics)
-                    total_ops += metrics['mfu/critic'] / self.critic_wg.config.ppo_epochs * promised_flops * self.critic_wg.world_size
+                        # critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                        # metrics.update(critic_output_metrics)
+                        # total_ops += metrics['mfu/critic'] * promised_flops * 4
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                        metrics.update(actor_output_metrics)
-                    total_ops += metrics['mfu/actor'] / self.actor_rollout_wg.config.ppo_epochs * promised_flops * self.actor_rollout_wg.world_size
-
+                        # actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        # metrics.update(actor_output_metrics)
+                        # total_ops += metrics['mfu/actor'] * promised_flops * 4
+                    
+                    actor_output = actor_output.get()
+                    critic_output = critic_output.get()
+                    critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                    metrics.update(critic_output_metrics)
+                    total_ops += metrics['mfu/critic'] * promised_flops * 4
+                    actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                    metrics.update(actor_output_metrics)
+                    total_ops += metrics['mfu/actor'] * promised_flops * 4
+                    
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
                         self.global_steps % self.config.trainer.test_freq == 0:
@@ -988,7 +1012,6 @@ class RayPPOTrainer(object):
                             self.global_steps % self.config.trainer.save_freq == 0:
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
-
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
@@ -1013,3 +1036,7 @@ class RayPPOTrainer(object):
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
                     return
+            # prof.stop()
+            # prof.export_chrome_trace("/workspace/verlpy310/torch_trace.json")
+            # prof.export_stacks("/workspace/verlpy310/torch_cpu_stack.json", metric="self_cpu_time_total")
+            # prof.export_stacks("/workspace/verlpy310/torch_cuda_stack.json", metric="self_cuda_time_total")

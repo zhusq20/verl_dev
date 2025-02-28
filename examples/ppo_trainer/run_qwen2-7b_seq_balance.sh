@@ -9,8 +9,8 @@ test_files="['$gsm8k_test_path']"
 python3 -m verl.trainer.main_ppo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
-    data.train_batch_size=16 \
-    data.val_batch_size=16 \
+    data.train_batch_size=32 \
+    data.val_batch_size=32 \
     data.max_prompt_length=1024 \
     data.max_response_length=512 \
     actor_rollout_ref.model.path=/workspace/HuggingFace-Download-Accelerator/qwen/models--Qwen--Qwen2.5-0.5B-Instruct \
@@ -25,7 +25,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=24000 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=24000 \

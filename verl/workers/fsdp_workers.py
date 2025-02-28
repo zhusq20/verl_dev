@@ -409,7 +409,7 @@ class ActorRolloutRefWorker(Worker):
             self.flops_counter = FlopsCounter(ref_model_config)
         torch.cuda.empty_cache()
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def update_actor(self, data: DataProto):
         data = data.to('cuda')
 
@@ -457,7 +457,6 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         prompts = prompts.to('cuda')
-
         assert self._is_rollout
         if self._is_offload_param:
             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
@@ -474,24 +473,41 @@ class ActorRolloutRefWorker(Worker):
                 if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
+        prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                on_trace_ready=torch.profiler.tensorboard_trace_handler('/workspace/verlpy310/log/grpo_0228'),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                with_flops=True
+        )
+        prof.start()
+        
         with self.rollout_sharding_manager:
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
-
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
-
+            with Timer(name='rollout', logger=None) as timer:
+                output = self.rollout.generate_sequences(prompts=prompts)
+            delta_time = timer.last
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
+            
 
         output = output.to('cpu')
-
+        output.meta_info["rollout_time"]=delta_time
+        
         if self._is_offload_param:
             # NOTE(sgm): the grad is already in CPU, only offload param here
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
+        prof.step()
+        prof.stop()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -816,7 +832,7 @@ class CriticWorker(Worker):
         torch.cuda.empty_cache()
         return output
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def update_critic(self, data: DataProto):
         data = data.to('cuda')
         if self._is_offload_param:
