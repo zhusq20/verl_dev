@@ -993,13 +993,15 @@ class RayPPOTrainer(object):
                         # total_ops += metrics['mfu/actor'] * promised_flops * 4
                     
                     actor_output = actor_output.get()
-                    critic_output = critic_output.get()
-                    critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
-                    metrics.update(critic_output_metrics)
-                    total_ops += metrics['mfu/critic'] * promised_flops * 4
-                    actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                    metrics.update(actor_output_metrics)
-                    total_ops += metrics['mfu/actor'] * promised_flops * 4
+                    if self.use_critic:
+                        critic_output = critic_output.get()
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                        metrics.update(critic_output_metrics)
+                        total_ops += metrics['mfu/critic'] * promised_flops * 4
+                    if self.config.trainer.critic_warmup <= self.global_steps:
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        metrics.update(actor_output_metrics)
+                        total_ops += metrics['mfu/actor'] * promised_flops * 4
                     
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \

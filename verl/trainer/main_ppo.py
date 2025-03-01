@@ -74,16 +74,18 @@ def main_task(config, compute_score=None):
     }
 
     actor_pool_id= 'actor_pool_id'
-    other_pool_id = 'other_pool'
+    critic_pool_id = 'critic_pool_id'
+    policy_pool_id = 'policy_pool_id'
     resource_pool_spec = {
-    actor_pool_id: [2],
-    other_pool_id: [2]
+    actor_pool_id: [8],
+    # critic_pool_id: [4],
+    # policy_pool_id: [2],
     }
     
     mapping = {
     Role.ActorRollout: actor_pool_id,
-    Role.Critic: other_pool_id,
-    Role.RefPolicy: other_pool_id,
+    Role.Critic: actor_pool_id,
+    Role.RefPolicy: actor_pool_id,
     }
 
     # global_pool_id = 'global_pool'

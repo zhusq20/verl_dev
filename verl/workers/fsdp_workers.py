@@ -473,18 +473,18 @@ class ActorRolloutRefWorker(Worker):
                 if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        prof = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                    ],
-                on_trace_ready=torch.profiler.tensorboard_trace_handler('/workspace/verlpy310/log/grpo_0228'),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True,
-                with_flops=True
-        )
-        prof.start()
+        # prof = torch.profiler.profile(
+        #         activities=[
+        #             torch.profiler.ProfilerActivity.CPU,
+        #             torch.profiler.ProfilerActivity.CUDA,
+        #             ],
+        #         on_trace_ready=torch.profiler.tensorboard_trace_handler('/workspace/verlpy310/log/grpo_0228'),
+        #         record_shapes=True,
+        #         profile_memory=True,
+        #         with_stack=True,
+        #         with_flops=True
+        # )
+        # prof.start()
         
         with self.rollout_sharding_manager:
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
@@ -506,8 +506,8 @@ class ActorRolloutRefWorker(Worker):
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
-        prof.step()
-        prof.stop()
+        # prof.step()
+        # prof.stop()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
