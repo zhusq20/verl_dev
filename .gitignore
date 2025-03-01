@@ -17,8 +17,8 @@ tensorflow/my_graph/*
 .idea/
 # C extensions
 *.so
-.runs/
-.log/
+runs/
+log/
 #nsys
 *.qdrep
 *.sqlite
