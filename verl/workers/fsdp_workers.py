@@ -402,7 +402,7 @@ class ActorRolloutRefWorker(Worker):
                                                             tokenizer=self.tokenizer)
         else:
             from transformers import AutoModelForCausalLM, AutoConfig
-            local_path = copy_local_path_from_hdfs(self.config.model.path)
+            local_path = copy_to_local(self.config.model.path)
             ref_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=True)
             self.flops_counter = FlopsCounter(ref_model_config)
         torch.cuda.empty_cache()
