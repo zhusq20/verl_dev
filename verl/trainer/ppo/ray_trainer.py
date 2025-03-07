@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import sys
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from enum import Enum
 from pprint import pprint
 from typing import Type, Dict
 from copy import deepcopy
+from tensordict import TensorDict
 
 import numpy as np
 from codetiming import Timer
@@ -601,6 +603,7 @@ class RayPPOTrainer(object):
                 'recompute_log_prob': False,
                 'do_sample': False,
                 'validate': True,
+                'partial_rollout_enable': False,
             }
 
             # pad to be divisible by dp_size
@@ -844,6 +847,8 @@ class RayPPOTrainer(object):
 
         # we start from step 1
         self.global_steps += 1
+        
+        replay_buffer: DataProto = DataProto()
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -854,8 +859,17 @@ class RayPPOTrainer(object):
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
+                print(f'Step: {self.global_steps}')
+
                 # pop those keys for generation
+                partial_rollout_enable = False
+                if self.config.actor_rollout_ref.rollout.partial_rollout_save_steps:
+                    partial_rollout_enable = True
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+                gen_batch.meta_info = {
+                    'partial_rollout_enable': partial_rollout_enable,
+                }
+
                 with _timer('step', timing_raw):
                     
                     # generate a batch
@@ -882,7 +896,37 @@ class RayPPOTrainer(object):
                                                              dtype=object)
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if partial_rollout_enable:
+                        if len(replay_buffer) > 0:
+                            batch = DataProto.concat([replay_buffer, batch])
+                            replay_buffer = DataProto()
                     batch = batch.union(gen_batch_output)
+                    if partial_rollout_enable:
+                        output_finished = batch.non_tensor_batch.pop('output_finished')
+                        print(f"output_finished size: {output_finished.shape}, output: {output_finished}")
+                        selected_replay_index = []
+                        finished_index = []
+                        for index, finished in enumerate(output_finished.tolist()):
+                            if finished:
+                                finished_index.append(index)
+                            else:
+                                selected_replay_index.append(index)
+                        print(f"selected_replay_index length: {len(selected_replay_index)}, finished_index length: {len(finished_index)}")
+                        batch_dict = {}
+                        batch_replay = {}
+                        for key, value in batch.batch.items():
+                            batch_replay[key] = torch.index_select(value, dim=0, index=torch.IntTensor(selected_replay_index))
+                            batch_dict[key] = torch.index_select(value, dim=0, index=torch.IntTensor(finished_index))
+                        non_tensor_batch = {}
+                        non_tensor_batch_replay = {}
+                        for key, value in batch.non_tensor_batch.items():
+                            non_tensor_batch_replay[key] = value[selected_replay_index]
+                            non_tensor_batch[key] = value[finished_index]
+                        batch = DataProto(batch=TensorDict(batch_dict, batch_size=len(finished_index)),
+                                          non_tensor_batch=non_tensor_batch,
+                                          meta_info=batch.meta_info)
+                        replay_buffer = DataProto(batch=TensorDict(batch_replay, batch_size=len(selected_replay_index)),
+                                                  non_tensor_batch=non_tensor_batch_replay)
 
                     response_info = _compute_response_info(batch)
                     prompt_length = response_info['prompt_length']
@@ -973,7 +1017,8 @@ class RayPPOTrainer(object):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
-                    total_ops += metrics['mfu/critic'] / self.critic_wg.config.ppo_epochs * promised_flops * self.critic_wg.world_size
+                        
+                        total_ops += metrics['mfu/critic'] / self.critic_wg.config.ppo_epochs * promised_flops * self.critic_wg.world_size
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -982,7 +1027,9 @@ class RayPPOTrainer(object):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
-                    total_ops += metrics['mfu/actor'] / self.actor_rollout_wg.config.ppo_epochs * promised_flops * self.actor_rollout_wg.world_size
+                        
+                    # can't directly obtain self.actor_rollout_wg.config
+                    total_ops += metrics['mfu/actor'] / 1 * promised_flops * 4 # world_size 4/8
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \

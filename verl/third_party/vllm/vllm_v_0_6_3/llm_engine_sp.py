@@ -32,7 +32,6 @@ from vllm.config import (
     SchedulerConfig,
     SpeculativeConfig,
 )
-from vllm.core.scheduler import Scheduler
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.llm_engine import LLMEngine, SchedulerContext, SchedulerOutputState, _load_generation_config_dict
 from vllm.engine.metrics_types import StatLoggerBase
@@ -53,6 +52,7 @@ from vllm.version import __version__ as VLLM_VERSION
 from .arg_utils import EngineArgs
 from .config import LoadConfig, ModelConfig
 from .tokenizer import TokenizerGroup
+from .scheduler import Scheduler
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -115,6 +115,7 @@ class LLMEngine(LLMEngine):
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
         input_registry: InputRegistry = INPUT_REGISTRY,
         use_cached_outputs: bool = False,
+        partial_rollout_save_steps: Optional[int] = None,
     ) -> None:
         logger.info(
             "Initializing an LLM engine (v%s) with config: "
@@ -289,6 +290,7 @@ class LLMEngine(LLMEngine):
                 lora_config,
                 parallel_config.pipeline_parallel_size,
                 self.async_callbacks[v_id] if model_config.use_async_output_proc else None,
+                partial_rollout_save_steps,
             ) for v_id in range(parallel_config.pipeline_parallel_size)
         ]
 
@@ -376,6 +378,7 @@ class LLMEngine(LLMEngine):
         engine_args: EngineArgs,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
+        partial_rollout_save_steps: Optional[int] = None,
     ) -> "LLMEngine":
         """Creates an LLM engine from the engine arguments."""
         # Create the engine configs.
@@ -398,6 +401,7 @@ class LLMEngine(LLMEngine):
             log_stats=not engine_args.disable_log_stats,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
+            partial_rollout_save_steps=partial_rollout_save_steps,
         )
         return engine
 
@@ -406,3 +410,12 @@ class LLMEngine(LLMEngine):
 
     def offload_model_weights(self) -> None:
         self.model_executor.offload_model_weights()
+        
+    def set_partial_rollout_enable(self, partial_rollout_enable, virtual_engine=0) -> None:
+        self.scheduler[virtual_engine].set_partial_rollout_enable(partial_rollout_enable)
+        
+    def clear_partial_rollout_decoding_steps(self, virtual_engine=0) -> None:
+        self.scheduler[virtual_engine].clear_partial_rollout_decoding_steps()
+    
+    def has_unfinished_requests(self, virtual_engine=0) -> bool:
+        return self.scheduler[virtual_engine].has_unfinished_requests() and super().has_unfinished_requests()

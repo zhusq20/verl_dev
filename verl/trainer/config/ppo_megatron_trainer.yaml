@@ -81,6 +81,7 @@ actor_rollout_ref:
       gate_proj_layer_name: gate_up
     # number of responses (i.e. num sample times)
     n: 1
+    partial_rollout_save_steps: null
 
 critic:
   strategy: megatron

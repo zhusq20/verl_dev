@@ -33,3 +33,5 @@ rollout:
   log_prob_micro_batch_size_per_gpu: 8
   # for hf rollout
   do_sample: True
+  # for partial rollout
+  partial_rollout_save_steps: null

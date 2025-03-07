@@ -87,6 +87,7 @@ actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
+    partial_rollout_save_steps: null
 
 critic:
   strategy: fsdp

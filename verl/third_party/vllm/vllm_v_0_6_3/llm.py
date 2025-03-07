@@ -13,7 +13,7 @@
 # limitations under the License.
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/entrypoints/llm.py
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Sequence
 
 import torch
 import torch.nn as nn
@@ -23,10 +23,18 @@ from verl.workers.rollout.tokenizer import HybridEngineBaseTokenizer
 from vllm import LLM
 from vllm.outputs import EmbeddingRequestOutput, RequestOutput
 from vllm.utils import Counter
+from vllm.inputs import PromptType
+from vllm.lora.request import LoRARequest
+from vllm.prompt_adapter.request import PromptAdapterRequest
+from vllm.sampling_params import SamplingParams
+from vllm.usage.usage_lib import UsageContext
+from vllm.model_executor.guided_decoding.guided_fields import (
+    GuidedDecodingRequest, LLMGuidedOptions)
 
 from .arg_utils import EngineArgs
 from .llm_engine_sp import LLMEngine
 
+from tqdm import tqdm
 
 class LLM(LLM):
     """An LLM for generating texts from given prompts and sampling parameters.
@@ -104,6 +112,7 @@ class LLM(LLM):
         max_seq_len_to_capture: int = 8192,
         disable_custom_all_reduce: bool = False,
         load_format="auto",
+        partial_rollout_save_steps: Optional[int] = None,
         **kwargs,
     ) -> None:
         if "disable_log_stats" not in kwargs:
@@ -139,8 +148,22 @@ class LLM(LLM):
                 f"Unexpected tokenizer type: {type(tokenizer)}. Must be"
                 "one of the following: PreTrainedTokenizer, PreTrainedTokenizerFast, verl.workers.rollout.HybridEngineBaseTokenizer"
             )
-        self.llm_engine = LLMEngine.from_engine_args(model, tokenizer, engine_args)  # TODO: check usagecontext
+        self.llm_engine = LLMEngine.from_engine_args(model, 
+                                                     tokenizer, 
+                                                     engine_args, 
+                                                     usage_context=UsageContext.LLM_CLASS,
+                                                     partial_rollout_save_steps=partial_rollout_save_steps, )
         self.request_counter = Counter()
+        
+        # Partial rollout
+        if partial_rollout_save_steps:
+            # FIXME: delete this info when things are normal
+            print(f'Partial rollout activated: partial_rollout_save_steps = {partial_rollout_save_steps}')
+            self.partial_rollout_save_steps = partial_rollout_save_steps
+        else:
+            print('Partial rollout deactivated')
+            self.partial_rollout_save_steps = kwargs["max_model_len"] + 1
+        self.partial_rollout_enable = False
 
     def init_cache_engine(self):
         self.llm_engine.init_cache_engine()
@@ -156,9 +179,91 @@ class LLM(LLM):
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
     ) -> None:
         self.llm_engine.tokenizer = tokenizer
+        
+    def generate(
+        self,
+        prompts: Union[Union[PromptType, Sequence[PromptType]],
+                       Optional[Union[str, List[str]]]] = None,
+        sampling_params: Optional[Union[SamplingParams,
+                                        Sequence[SamplingParams]]] = None,
+        prompt_token_ids: Optional[Union[List[int], List[List[int]]]] = None,
+        partial_rollout_enable: bool = False,
+        use_tqdm: bool = True,
+        lora_request: Optional[Union[List[LoRARequest], LoRARequest]] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        guided_options_request: Optional[Union[LLMGuidedOptions,
+                                               GuidedDecodingRequest]] = None,
+        priority: Optional[List[int]] = None,
+    ) -> List[RequestOutput]:
+        self.partial_rollout_enable = partial_rollout_enable
+        return super().generate(
+            prompts=prompts,
+            sampling_params=sampling_params,
+            prompt_token_ids=prompt_token_ids,
+            use_tqdm=use_tqdm,
+            lora_request=lora_request,
+            prompt_adapter_request=prompt_adapter_request,
+            guided_options_request=guided_options_request,
+            priority=priority,
+        )
 
     def _run_engine(self, *, use_tqdm: bool) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
-        outputs = super()._run_engine(use_tqdm=use_tqdm)
+        # Initialize tqdm.
+        if use_tqdm:
+            num_requests = self.llm_engine.get_num_unfinished_requests()
+            pbar = tqdm(
+                total=num_requests,
+                desc="Processed prompts",
+                dynamic_ncols=True,
+                postfix=(f"est. speed input: {0:.2f} toks/s, "
+                         f"output: {0:.2f} toks/s"),
+            )
+            
+        # Set partial_rollout_enable of scheduler
+        self.llm_engine.set_partial_rollout_enable(self.partial_rollout_enable)
+
+        # In the loop below, we need to use both finished and unfinished responses
+        self.llm_engine.step_return_finished_only = False
+
+        # Run the engine.
+        outputs: List[Union[RequestOutput, EmbeddingRequestOutput]] = []
+        total_in_toks = 0
+        total_out_toks = 0
+        
+        request_output_buffer: Dict = {}
+        
+        while self.llm_engine.has_unfinished_requests():
+            step_outputs = self.llm_engine.step()
+            for output in step_outputs:
+                request_output_buffer[output.request_id] = output
+                if output.finished:
+                    if use_tqdm:
+                        if isinstance(output, RequestOutput):
+                            # Calculate tokens only for RequestOutput
+                            total_in_toks += len(output.prompt_token_ids)
+                            in_spd = total_in_toks / pbar.format_dict["elapsed"]
+                            total_out_toks += sum(
+                                len(stp.token_ids) for stp in output.outputs)
+                            out_spd = (total_out_toks /
+                                       pbar.format_dict["elapsed"])
+                            pbar.postfix = (
+                                f"est. speed input: {in_spd:.2f} toks/s, "
+                                f"output: {out_spd:.2f} toks/s")
+                        pbar.update(1)
+
+        for _, request_output in request_output_buffer.items():
+            outputs.append(request_output)
+        self.llm_engine.clear_partial_rollout_decoding_steps()
+
+        # Restore original behavior
+        self.llm_engine.step_return_finished_only = False
+
+        if use_tqdm:
+            pbar.close()
+        # Sort the outputs by request ID.
+        # This is necessary because some requests may be finished earlier than
+        # its previous requests.
+        outputs = sorted(outputs, key=lambda x: int(x.request_id))
         return self._post_process_outputs(outputs)
 
     # # NOTE(shengguangming): add for verl
@@ -171,9 +276,10 @@ class LLM(LLM):
     #     return token_ids
 
     # NOTE(shengguangming): add for verl
-    def _post_process_outputs(self, request_outputs: List[RequestOutput]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _post_process_outputs(self, request_outputs: List[RequestOutput]) -> Tuple[torch.Tensor, torch.Tensor, List[bool]]:
         output_token_ids = []
         logprobs = []
+        output_finished = [output.finished for output in request_outputs]
         for request_output in request_outputs:  # List[RequestOutput]
             outputs = request_output.outputs
             for output in outputs:  # List[CompletionOutput], usually len == 1
@@ -191,7 +297,7 @@ class LLM(LLM):
         output_token_ids = pad_sequence(output_token_ids, batch_first=True, padding_value=pad_token_id)
         if len(logprobs) > 0:
             logprobs = pad_sequence(logprobs, batch_first=True, padding_value=pad_token_id)
-        return output_token_ids, logprobs
+        return output_token_ids, logprobs, output_finished
 
     def sync_model_weights(self, actor_weights: Dict[str, torch.Tensor], load_format: str) -> None:
         self.llm_engine.sync_model_weights(actor_weights=actor_weights, load_format=load_format)

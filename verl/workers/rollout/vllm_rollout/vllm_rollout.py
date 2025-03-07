@@ -28,6 +28,7 @@ from typing import List
 from contextlib import contextmanager
 from omegaconf import DictConfig
 import torch
+import numpy as np
 import torch.distributed
 from tensordict import TensorDict
 from torch import nn
@@ -103,6 +104,7 @@ class vLLMRollout(BaseRollout):
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
+            partial_rollout_save_steps=config.partial_rollout_save_steps
         )
 
         # Offload vllm model to reduce peak memory usage
@@ -127,6 +129,9 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        
+        # Partial rollout
+        self.replay_buffer = DataProto()
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -154,7 +159,7 @@ class vLLMRollout(BaseRollout):
         # left-padded attention_mask
         attention_mask = prompts.batch['attention_mask']
         position_ids = prompts.batch['position_ids']
-
+        partial_rollout_enable = prompts.meta_info['partial_rollout_enable']
         # used to construct attention_mask
         eos_token_id = prompts.meta_info['eos_token_id']
 
@@ -177,17 +182,21 @@ class vLLMRollout(BaseRollout):
             }
 
         # users can customize different sampling_params at different run
+        print(f"idx list size: {len(idx_list)}, batch size: {batch_size}")
         with self.update_sampling_params(**kwargs):
             output = self.inference_engine.generate(
                 prompts=None,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
                 prompt_token_ids=idx_list,
+                partial_rollout_enable=partial_rollout_enable,
                 use_tqdm=False)
 
         # TODO(sgm): disable logprob when recompute_log_prob is enable
         # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
         response = output[0].to(idx.device)
         log_probs = output[1].to(idx.device)
+        output_finished = output[2]
+        print(f"request_batch: {len(output_finished)}")
 
         if response.shape[1] < self.config.response_length:
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
@@ -198,6 +207,16 @@ class vLLMRollout(BaseRollout):
             attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
             position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
             batch_size = batch_size * self.config.n
+        # Partial rollout add requests
+        last_batch_size = 0
+        if len(self.replay_buffer) > 0:
+            idx = torch.cat((self.replay_buffer.batch['input_ids'], idx), dim=0)
+            attention_mask = torch.cat((self.replay_buffer.batch['attention_mask'], attention_mask), dim=0)
+            position_ids = torch.cat((self.replay_buffer.batch['position_ids'], position_ids), dim=0)
+            last_batch_size = len(self.replay_buffer)
+            batch_size = last_batch_size + batch_size
+            self.replay_buffer = DataProto()
+        print(f"idx size: {idx.shape}, response size: {response.shape}")
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
@@ -212,6 +231,38 @@ class vLLMRollout(BaseRollout):
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
         response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+        
+        # Partial rollout
+        def del_append_tensor_lines_n(arr_del, arr_append, index, n):
+            arr1 = arr_del[0:index]
+            arr2 = arr_del[index+n:]
+            arr_append = torch.cat((arr_append, arr_del[index:index+n]), dim=0)
+            return torch.cat((arr1,arr2), dim=0)
+        idx_replay = idx[0:0]
+        attention_mask_replay = attention_mask[0:0]
+        position_ids_replay = position_ids[0:0]
+        replay = False
+        batch_size_replay = 0
+        if partial_rollout_enable:
+            for index, finished in enumerate(output_finished):
+                if not finished:
+                    replay = True
+                    idx = del_append_tensor_lines_n(idx, idx_replay, index*self.config.n, self.config.n)
+                    attention_mask = del_append_tensor_lines_n(attention_mask, attention_mask_replay, index*self.config.n, self.config.n)
+                    position_ids = del_append_tensor_lines_n(position_ids, position_ids_replay, index*self.config.n, self.config.n)
+                    batch_size = batch_size - self.config.n
+                    batch_size_replay = batch_size_replay + self.config.n
+        if replay:
+            print("Save replay buffer")
+            batch_replay = TensorDict(
+                {
+                    'input_ids': idx_replay,
+                    'attention_mask': attention_mask_replay,
+                    'position_ids': position_ids_replay
+                },
+                batch_size=batch_size_replay)
+            self.replay_buffer = DataProto(batch=batch_replay)
+        output_finished = np.repeat(np.array(output_finished, dtype=object), self.config.n, axis=0)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
         batch = TensorDict(
@@ -229,4 +280,11 @@ class vLLMRollout(BaseRollout):
         if self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
 
-        return DataProto(batch=batch)
+        if partial_rollout_enable:
+            output_proto = DataProto(batch=batch)
+            output_proto.non_tensor_batch = {
+                "output_finished": output_finished,
+            }
+            return output_proto
+        else:
+            return DataProto(batch=batch)
