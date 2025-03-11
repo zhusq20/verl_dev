@@ -900,10 +900,8 @@ class RayPPOTrainer(object):
                         if len(replay_buffer) > 0:
                             batch = DataProto.concat([replay_buffer, batch])
                             replay_buffer = DataProto()
-                    batch = batch.union(gen_batch_output)
                     if partial_rollout_enable:
-                        output_finished = batch.non_tensor_batch.pop('output_finished')
-                        print(f"output_finished size: {output_finished.shape}, output: {output_finished}")
+                        output_finished = gen_batch_output.meta_info["output_finished"]
                         selected_replay_index = []
                         finished_index = []
                         for index, finished in enumerate(output_finished.tolist()):
@@ -911,7 +909,7 @@ class RayPPOTrainer(object):
                                 finished_index.append(index)
                             else:
                                 selected_replay_index.append(index)
-                        print(f"selected_replay_index length: {len(selected_replay_index)}, finished_index length: {len(finished_index)}")
+                        # print(f"selected_replay_index length: {len(selected_replay_index)}, finished_index length: {len(finished_index)}")
                         batch_dict = {}
                         batch_replay = {}
                         for key, value in batch.batch.items():
@@ -928,10 +926,11 @@ class RayPPOTrainer(object):
                         replay_buffer = DataProto(batch=TensorDict(batch_replay, batch_size=len(selected_replay_index)),
                                                   non_tensor_batch=non_tensor_batch_replay)
 
+                    batch = batch.union(gen_batch_output)
+                    
                     response_info = _compute_response_info(batch)
                     prompt_length = response_info['prompt_length']
                     response_length = response_info['response_length']
-                    # print(f'prompt_length: {prompt_length}')
                     result = self.actor_rollout_wg.count_flops_rollout(prompt_length, response_length, timing_raw['gen'])
                     # print("resultlol",result)
                     estimated_flops, promised_flops, tmp_ops = result[0]

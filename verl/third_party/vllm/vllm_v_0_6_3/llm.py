@@ -28,6 +28,7 @@ from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
 from vllm.usage.usage_lib import UsageContext
+from vllm.sequence import (Sequence, SequenceGroup)
 from vllm.model_executor.guided_decoding.guided_fields import (
     GuidedDecodingRequest, LLMGuidedOptions)
 
@@ -113,6 +114,7 @@ class LLM(LLM):
         disable_custom_all_reduce: bool = False,
         load_format="auto",
         partial_rollout_save_steps: Optional[int] = None,
+        partial_rollout_mode: Optional[str] = None,
         **kwargs,
     ) -> None:
         if "disable_log_stats" not in kwargs:
@@ -156,14 +158,18 @@ class LLM(LLM):
         self.request_counter = Counter()
         
         # Partial rollout
+        self.partial_rollout_save_steps = partial_rollout_save_steps
         if partial_rollout_save_steps:
-            # FIXME: delete this info when things are normal
-            print(f'Partial rollout activated: partial_rollout_save_steps = {partial_rollout_save_steps}')
-            self.partial_rollout_save_steps = partial_rollout_save_steps
-        else:
-            print('Partial rollout deactivated')
-            self.partial_rollout_save_steps = kwargs["max_model_len"] + 1
+            if not partial_rollout_mode in ["reuse", "recompute"]:
+                raise ValueError(
+                    f"Unexpected partial_rollout_mode value: {partial_rollout_mode}. Must be"
+                    "one of the following: reuse, recompute"
+                )
+        self.partial_rollout_mode = partial_rollout_mode
+        self.llm_engine.set_partial_rollout_mode(partial_rollout_mode)
         self.partial_rollout_enable = False
+        self.partial_rollout_id_response_mapping = {}
+        self.partial_rollout_id_id_mapping = {}
 
     def init_cache_engine(self):
         self.llm_engine.init_cache_engine()
@@ -179,33 +185,6 @@ class LLM(LLM):
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
     ) -> None:
         self.llm_engine.tokenizer = tokenizer
-        
-    def generate(
-        self,
-        prompts: Union[Union[PromptType, Sequence[PromptType]],
-                       Optional[Union[str, List[str]]]] = None,
-        sampling_params: Optional[Union[SamplingParams,
-                                        Sequence[SamplingParams]]] = None,
-        prompt_token_ids: Optional[Union[List[int], List[List[int]]]] = None,
-        partial_rollout_enable: bool = False,
-        use_tqdm: bool = True,
-        lora_request: Optional[Union[List[LoRARequest], LoRARequest]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        guided_options_request: Optional[Union[LLMGuidedOptions,
-                                               GuidedDecodingRequest]] = None,
-        priority: Optional[List[int]] = None,
-    ) -> List[RequestOutput]:
-        self.partial_rollout_enable = partial_rollout_enable
-        return super().generate(
-            prompts=prompts,
-            sampling_params=sampling_params,
-            prompt_token_ids=prompt_token_ids,
-            use_tqdm=use_tqdm,
-            lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request,
-            guided_options_request=guided_options_request,
-            priority=priority,
-        )
 
     def _run_engine(self, *, use_tqdm: bool) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
         # Initialize tqdm.
@@ -219,11 +198,7 @@ class LLM(LLM):
                          f"output: {0:.2f} toks/s"),
             )
             
-        # Set partial_rollout_enable of scheduler
-        self.llm_engine.set_partial_rollout_enable(self.partial_rollout_enable)
-
         # In the loop below, we need to use both finished and unfinished responses
-        self.llm_engine.step_return_finished_only = False
 
         # Run the engine.
         outputs: List[Union[RequestOutput, EmbeddingRequestOutput]] = []
@@ -232,8 +207,13 @@ class LLM(LLM):
         
         request_output_buffer: Dict = {}
         
+        is_first_step = True
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
+            # after a step, we transfer partial
+            if is_first_step:
+                self.transfer_partial()
+                is_first_step = False
             for output in step_outputs:
                 request_output_buffer[output.request_id] = output
                 if output.finished:
@@ -255,15 +235,33 @@ class LLM(LLM):
             outputs.append(request_output)
         self.llm_engine.clear_partial_rollout_decoding_steps()
 
-        # Restore original behavior
-        self.llm_engine.step_return_finished_only = False
-
         if use_tqdm:
             pbar.close()
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
         outputs = sorted(outputs, key=lambda x: int(x.request_id))
+        # remove unfinished ones
+        for key, val in self.partial_rollout_id_response_mapping.items():
+            for i in range(len(val)-1, -1, -1):
+                if not val[i][2]:
+                    del self.partial_rollout_id_response_mapping[key][i]
+        # append finished and unfinished ones
+        if len(self.partial_rollout_id_id_mapping) > 0 and self.partial_rollout_enable:
+            for i in range(len(outputs)-1, -1, -1):
+                request_output = outputs[i]
+                if request_output.request_id in self.partial_rollout_id_id_mapping:
+                    group_id = self.partial_rollout_id_id_mapping[request_output.request_id]
+                    logprobs_dicts = request_output.outputs[0].logprobs
+                    logprob = []
+                    if logprobs_dicts is not None:
+                        for logprobs_dict, id in zip(logprobs_dicts, request_output.outputs[0].token_ids):
+                            logprob.append(logprobs_dict[id].logprob)
+                    self.partial_rollout_id_response_mapping[group_id].append(
+                        tuple((torch.tensor(request_output.outputs[0].token_ids), torch.tensor(logprob), request_output.finished)))
+                    if request_output.finished:
+                        del self.partial_rollout_id_id_mapping[request_output.request_id]
+                    del outputs[i]
         return self._post_process_outputs(outputs)
 
     # # NOTE(shengguangming): add for verl
@@ -279,7 +277,20 @@ class LLM(LLM):
     def _post_process_outputs(self, request_outputs: List[RequestOutput]) -> Tuple[torch.Tensor, torch.Tensor, List[bool]]:
         output_token_ids = []
         logprobs = []
-        output_finished = [output.finished for output in request_outputs]
+        output_finished = []
+        if len(self.partial_rollout_id_response_mapping) > 0 and self.partial_rollout_enable:
+            for x in sorted(self.partial_rollout_id_response_mapping.items(), key=lambda item:item[0]):
+                key = x[0]
+                val = x[1]
+                for v in val:
+                    output_token_ids.append(torch.tensor(v[0]))
+                    logprobs.append(torch.tensor(v[1]))
+                finished = all([v[2] for v in val])
+                output_finished.append(finished)
+                if finished:
+                    del self.partial_rollout_id_response_mapping[key]
+        output_finished.extend([output.finished for output in request_outputs])
+        
         for request_output in request_outputs:  # List[RequestOutput]
             outputs = request_output.outputs
             for output in outputs:  # List[CompletionOutput], usually len == 1
@@ -304,3 +315,63 @@ class LLM(LLM):
 
     def offload_model_weights(self) -> None:
         self.llm_engine.offload_model_weights()
+        
+    def set_partial_rollout_enable(self, partial_rollout_enable: bool):
+        if partial_rollout_enable:
+            assert self.partial_rollout_save_steps, "To use partial rollout, partial_rollout_save_steps is needed"
+        self.partial_rollout_enable = partial_rollout_enable
+        # Set partial_rollout_enable of scheduler
+        self.llm_engine.set_partial_rollout_enable(partial_rollout_enable)
+
+    def transfer_partial(self) -> None:
+        if self.partial_rollout_enable:
+            if self.partial_rollout_mode == "recompute":
+                self.llm_engine.transfer_partial_to_waiting()
+            else: # reuse
+                self.llm_engine.transfer_partial_to_swapped()
+
+    def reschedule_partial_requests(self, n_seqs: bool) -> None:
+        if n_seqs and self.partial_rollout_mode == "recompute":  
+            # sort seq_groups by request_id
+            sorted_partial_seq_groups = self.llm_engine.sorted_partial_seq_groups()
+            print(f"sorted_partial_seq_groups length: {len(sorted_partial_seq_groups)}")
+            for seq_group in sorted_partial_seq_groups:
+                if seq_group.num_seqs() == 1:
+                    self.llm_engine.add_decomposed_partial_seq_group(seq_group)
+                    continue
+                if seq_group.is_finished():
+                    continue
+                group_id = int(seq_group.request_id)
+                self.partial_rollout_id_response_mapping[group_id] = []
+                for seq in seq_group.seqs:
+                    # if finished, save it and wait to output
+                    output_tokens = seq.get_token_ids()[seq.get_prompt_len():]
+                    logprob = []
+                    logprobs_dicts = seq.output_logprobs
+                    if logprobs_dicts is not None:
+                        for logprobs_dict, id in zip(logprobs_dicts, output_tokens):
+                            logprob.append(logprobs_dict[id].logprob)
+                    self.partial_rollout_id_response_mapping[group_id].append(
+                        tuple((output_tokens, logprob, seq.is_finished())))
+                    if seq.is_finished():
+                        continue
+                    
+                    request_id = str(next(self.request_counter))
+                    self.partial_rollout_id_id_mapping[request_id] = group_id
+                    seq_group.sampling_params.n = 1
+                    decomposed_seq_group = SequenceGroup(
+                                            request_id=request_id,
+                                            seqs=[seq],
+                                            arrival_time=seq_group.arrival_time,
+                                            sampling_params=seq_group.sampling_params,
+                                            lora_request=seq_group.lora_request,
+                                            embeddings=seq_group.embeddings,
+                                            pooling_params=seq_group.pooling_params,
+                                            encoder_seq=seq_group.encoder_seq,
+                                            trace_headers=seq_group.trace_headers,
+                                            prompt_adapter_request=seq_group.prompt_adapter_request,
+                                            priority=seq_group.priority,)
+                    # then add new request
+                    self.llm_engine.add_decomposed_partial_seq_group(decomposed_seq_group)
+        else:
+            return

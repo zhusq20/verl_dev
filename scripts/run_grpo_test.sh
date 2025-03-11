@@ -47,8 +47,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
-    actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.partial_rollout_save_steps=650 \
+    actor_rollout_ref.rollout.partial_rollout_mode=reuse \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.kl_ctrl.kl_coef=0.001 \

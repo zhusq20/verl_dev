@@ -87,7 +87,9 @@ actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
+    # for partial rollout
     partial_rollout_save_steps: null
+    partial_rollout_mode: null # value must be in ['reuse', 'recompute']
 
 critic:
   strategy: fsdp

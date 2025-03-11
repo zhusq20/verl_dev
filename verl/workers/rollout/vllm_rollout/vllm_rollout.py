@@ -39,6 +39,7 @@ from verl.workers.rollout.base import BaseRollout
 from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
 from vllm import SamplingParams
+from vllm.sampling_params import RequestOutputKind
 
 # TODO
 # 1. support pp in vllm
@@ -104,7 +105,8 @@ class vLLMRollout(BaseRollout):
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            partial_rollout_save_steps=config.partial_rollout_save_steps
+            partial_rollout_save_steps=config.partial_rollout_save_steps,
+            partial_rollout_mode=config.partial_rollout_mode,
         )
 
         # Offload vllm model to reduce peak memory usage
@@ -182,13 +184,12 @@ class vLLMRollout(BaseRollout):
             }
 
         # users can customize different sampling_params at different run
-        print(f"idx list size: {len(idx_list)}, batch size: {batch_size}")
         with self.update_sampling_params(**kwargs):
+            self.inference_engine.set_partial_rollout_enable(partial_rollout_enable)
             output = self.inference_engine.generate(
                 prompts=None,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
                 prompt_token_ids=idx_list,
-                partial_rollout_enable=partial_rollout_enable,
                 use_tqdm=False)
 
         # TODO(sgm): disable logprob when recompute_log_prob is enable
@@ -196,32 +197,52 @@ class vLLMRollout(BaseRollout):
         response = output[0].to(idx.device)
         log_probs = output[1].to(idx.device)
         output_finished = output[2]
-        print(f"request_batch: {len(output_finished)}")
 
         if response.shape[1] < self.config.response_length:
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
             log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
+
+        if partial_rollout_enable:
+            n_seqs: bool = self.config.n > 1
+            self.inference_engine.reschedule_partial_requests(n_seqs)
 
         if self.config.n > 1 and do_sample:
             idx = idx.repeat_interleave(self.config.n, dim=0)
             attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
             position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
             batch_size = batch_size * self.config.n
+            output_finished = np.repeat(np.array(output_finished, dtype=object), self.config.n, axis=0)
         # Partial rollout add requests
         last_batch_size = 0
-        if len(self.replay_buffer) > 0:
+        if partial_rollout_enable and len(self.replay_buffer) > 0:
             idx = torch.cat((self.replay_buffer.batch['input_ids'], idx), dim=0)
             attention_mask = torch.cat((self.replay_buffer.batch['attention_mask'], attention_mask), dim=0)
             position_ids = torch.cat((self.replay_buffer.batch['position_ids'], position_ids), dim=0)
             last_batch_size = len(self.replay_buffer)
             batch_size = last_batch_size + batch_size
-            self.replay_buffer = DataProto()
-        print(f"idx size: {idx.shape}, response size: {response.shape}")
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
         delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+        
+        # Partial rollout
+        replay = False
+        selected_replay_index = []
+        finished_index = []
+        for index, finished in enumerate(output_finished):
+            if finished:
+                finished_index.append(index)
+            else:
+                replay = True
+                selected_replay_index.append(index)
+        if partial_rollout_enable:
+            print(f"finished_index: {len(finished_index)}, selected_replay_index: {len(selected_replay_index)}")
+            batch_replay = {}
+            batch_replay["input_ids"] = torch.index_select(idx, dim=0, index=torch.IntTensor(selected_replay_index).to(idx.device)).to(idx.device)
+            batch_replay["attention_mask"] = torch.index_select(attention_mask, dim=0, index=torch.IntTensor(selected_replay_index).to(idx.device)).to(idx.device)
+            batch_replay["position_ids"] = torch.index_select(position_ids, dim=0, index=torch.IntTensor(selected_replay_index).to(idx.device)).to(idx.device)
+            self.replay_buffer = DataProto(batch=TensorDict(batch_replay, batch_size=len(selected_replay_index)))
 
         # TODO(sgm): fix position_ids on right_pad
         # prompt: left pad + response: right pad
@@ -232,57 +253,35 @@ class vLLMRollout(BaseRollout):
         response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
         
-        # Partial rollout
-        def del_append_tensor_lines_n(arr_del, arr_append, index, n):
-            arr1 = arr_del[0:index]
-            arr2 = arr_del[index+n:]
-            arr_append = torch.cat((arr_append, arr_del[index:index+n]), dim=0)
-            return torch.cat((arr1,arr2), dim=0)
-        idx_replay = idx[0:0]
-        attention_mask_replay = attention_mask[0:0]
-        position_ids_replay = position_ids[0:0]
-        replay = False
-        batch_size_replay = 0
-        if partial_rollout_enable:
-            for index, finished in enumerate(output_finished):
-                if not finished:
-                    replay = True
-                    idx = del_append_tensor_lines_n(idx, idx_replay, index*self.config.n, self.config.n)
-                    attention_mask = del_append_tensor_lines_n(attention_mask, attention_mask_replay, index*self.config.n, self.config.n)
-                    position_ids = del_append_tensor_lines_n(position_ids, position_ids_replay, index*self.config.n, self.config.n)
-                    batch_size = batch_size - self.config.n
-                    batch_size_replay = batch_size_replay + self.config.n
-        if replay:
-            print("Save replay buffer")
-            batch_replay = TensorDict(
-                {
-                    'input_ids': idx_replay,
-                    'attention_mask': attention_mask_replay,
-                    'position_ids': position_ids_replay
-                },
-                batch_size=batch_size_replay)
-            self.replay_buffer = DataProto(batch=batch_replay)
-        output_finished = np.repeat(np.array(output_finished, dtype=object), self.config.n, axis=0)
-
-        # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
+        batch_dict = {
                 'prompts': idx,
                 'responses': response,
                 'input_ids': seq,  # here input_ids become the whole sentences
                 # 'old_log_probs': log_probs, # we will recompute old log prob with actor
                 'attention_mask': attention_mask,
                 'position_ids': position_ids
-            },
+            }
+        if partial_rollout_enable:
+            batch_size = len(finished_index)
+            batch_dict["prompts"] = torch.index_select(idx, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
+            batch_dict["responses"] = torch.index_select(response, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
+            batch_dict["input_ids"] = torch.index_select(seq, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
+            batch_dict["attention_mask"] = torch.index_select(attention_mask, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
+            batch_dict["position_ids"] = torch.index_select(position_ids, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
+
+        # all the tp ranks should contain the same data here. data in all ranks are valid
+        batch = TensorDict(
+            batch_dict,
             batch_size=batch_size)
 
         # free vllm cache engine
         if self.config.free_cache_engine:
-            self.inference_engine.free_cache_engine()
+            if self.config.partial_rollout_mode != "reuse":
+                self.inference_engine.free_cache_engine()
 
         if partial_rollout_enable:
             output_proto = DataProto(batch=batch)
-            output_proto.non_tensor_batch = {
+            output_proto.meta_info = {
                 "output_finished": output_finished,
             }
             return output_proto

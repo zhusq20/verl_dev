@@ -140,139 +140,96 @@ class Scheduler(Scheduler):
         
         # For partial rollout scheduler
         self.partial_rollout_save_steps = partial_rollout_save_steps
+        self.partial_rollout_mode = None
         self.sequence_group_rollout_steps: Dict = {}
         self.partial_rollout_enable = False
-        
-    def add_partial_rollout_decoding_steps(self, budget, request_id, max_num_running_seqs) -> None:
-        if request_id in self.sequence_group_rollout_steps:
-            if self.sequence_group_rollout_steps[request_id] < self.partial_rollout_save_steps:
-                budget.add_num_seqs(request_id, max_num_running_seqs)
-                self.sequence_group_rollout_steps[request_id] += 1
-        else:
-            self.sequence_group_rollout_steps[request_id] = 1
-            budget.add_num_seqs(request_id, max_num_running_seqs)
+        self.partial: Deque[SequenceGroup] = deque()
+        self.partial_rollout_blocks_to_swap_out: List[Tuple[int, int]] = []
         
     def clear_partial_rollout_decoding_steps(self) -> None:
         self.sequence_group_rollout_steps = {}
-        self.waiting.extendleft(self.running)
-        self.running.clear()
         
-    def _schedule_default(self) -> SchedulerOutputs:
-        """Schedule queued requests.
-        
-        The current policy is designed to optimize the throughput. First,
-        it batches as many prefill requests as possible. And it schedules
-        decodes. If there's a pressure on GPU memory, decode requests can
-        be swapped or preempted.
-        """
-        # Include running requests to the budget.
-        budget = SchedulingBudget(
-            token_budget=self.scheduler_config.max_num_batched_tokens,
-            max_num_seqs=self.scheduler_config.max_num_seqs,
-        )
-        # Make sure we include num running seqs before scheduling prefill,
-        # so that we don't schedule beyond max_num_seqs for prefill.
-        for seq_group in self.running:
-            if self.partial_rollout_save_steps and self.partial_rollout_enable:
-                print("Partial rollout scheduler enable", flush=True)
-                self.add_partial_rollout_decoding_steps(budget, seq_group.request_id,
-                                    seq_group.get_max_num_running_seqs())
-            else:
-                print("Partial rollout scheduler not enable", flush=True)
-                budget.add_num_seqs(seq_group.request_id,
-                                    seq_group.get_max_num_running_seqs())
-        curr_loras = set(
-            seq_group.lora_int_id for seq_group in self.running
-            if seq_group.lora_int_id > 0) if self.lora_enabled else None
-
-        prefills = SchedulerPrefillOutputs.create_empty()
-        running_scheduled = SchedulerRunningOutputs.create_empty()
-        swapped_in = SchedulerSwappedInOutputs.create_empty()
-
-        # If any requests are swapped, prioritized swapped requests.
-        if not self.swapped:
-            prefills = self._schedule_prefills(budget,
-                                               curr_loras,
-                                               enable_chunking=False)
-
-        # Don't schedule decodes if prefills are scheduled.
-        # NOTE: If `_schedule_prefills` doesn't enable chunking, self.running
-        # only contains decode requests, not chunked prefills.
-        if len(prefills.seq_groups) == 0:
-            running_scheduled = self._schedule_running(budget,
-                                                       curr_loras,
-                                                       enable_chunking=False)
-
-            # If any sequence group is preempted, do not swap in any sequence
-            # group. because it means there's no slot for new running requests.
-            if len(running_scheduled.preempted) + len(
-                    running_scheduled.swapped_out) == 0:
-                swapped_in = self._schedule_swapped(budget, curr_loras)
-
-        assert (budget.num_batched_tokens <=
-                self.scheduler_config.max_num_batched_tokens)
-        assert budget.num_curr_seqs <= self.scheduler_config.max_num_seqs
-
-        # Update waiting requests.
-        self.waiting.extendleft(running_scheduled.preempted)
-        # Update new running requests.
-        if len(prefills.seq_groups) > 0:
-            self.running.extend([s.seq_group for s in prefills.seq_groups])
-
-        self.running.extend(running_scheduled.decode_seq_groups_list)
-
-        if len(swapped_in.decode_seq_groups) > 0:
-            self.running.extend(
-                [s.seq_group for s in swapped_in.decode_seq_groups])
-
-        # Update swapped requests.
-        self.swapped.extend(running_scheduled.swapped_out)
-        preempted = (len(running_scheduled.preempted) +
-                     len(running_scheduled.swapped_out))
-
-        # There should be no prefill from running queue because this policy
-        # doesn't allow chunked prefills.
-        assert len(running_scheduled.prefill_seq_groups) == 0
-        assert len(swapped_in.prefill_seq_groups) == 0
-
-        # Merge lists
-        num_prefill_groups = len(prefills.seq_groups)
-        if num_prefill_groups > 0:
-            scheduled_seq_groups = prefills.seq_groups
-            scheduled_seq_groups.extend(running_scheduled.decode_seq_groups)
-        else:
-            scheduled_seq_groups = running_scheduled.decode_seq_groups
-        scheduled_seq_groups.extend(swapped_in.decode_seq_groups)
-
-        blocks_to_copy = running_scheduled.blocks_to_copy
-        blocks_to_copy.extend(swapped_in.blocks_to_copy)
-
-        ignored_seq_groups = prefills.ignored_seq_groups
-        ignored_seq_groups.extend(swapped_in.infeasible_seq_groups)
-
-        return SchedulerOutputs(
-            scheduled_seq_groups=scheduled_seq_groups,
-            num_prefill_groups=num_prefill_groups,
-            num_batched_tokens=budget.num_batched_tokens,
-            blocks_to_swap_in=swapped_in.blocks_to_swap_in,
-            blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
-            blocks_to_copy=blocks_to_copy,
-            ignored_seq_groups=ignored_seq_groups,
-            num_lookahead_slots=running_scheduled.num_lookahead_slots,
-            running_queue_size=len(self.running),
-            preempted=preempted,
-        )
-
     def set_partial_rollout_enable(self, partial_rollout_enable) -> None:
         self.partial_rollout_enable = partial_rollout_enable
+
+    def add_rollout_steps(self, request_id: Union[str, Iterable[str]]) -> None:
+        if request_id in self.sequence_group_rollout_steps:
+            self.sequence_group_rollout_steps[request_id] += 1
+        else:
+            self.sequence_group_rollout_steps[request_id] = 1
+
+    def get_rollout_steps(self, request_id: Union[str, Iterable[str]]) -> None:
+        if not request_id in self.sequence_group_rollout_steps:
+            return 0
+        return self.sequence_group_rollout_steps[request_id]
+    
+    def transfer_partial_rollout_requests(self, request_id: Union[str, Iterable[str]]) -> None:
+        if isinstance(request_id, str):
+            request_id = (request_id, )
+        request_ids = set(request_id)
+        waiting_groups: List[SequenceGroup] = []
+        for state_queue in [self.waiting, self.running, self.swapped]:
+            temp_groups: List[SequenceGroup] = []
+            for seq_group in state_queue:
+                if not request_ids:
+                    # Using 'break' here may add two extra iterations,
+                    # but is acceptable to reduce complexity.
+                    break
+                if seq_group.request_id in request_ids:
+                    if not seq_group.is_finished():
+                        waiting_groups.append(seq_group)
+                        temp_groups.append(seq_group)
+                    request_ids.remove(seq_group.request_id)
+            for temp_group in temp_groups:
+                # Remove the sequence group from the state queue.
+                state_queue.remove(temp_group)
+        for i in range(len(waiting_groups)-1, -1, -1):
+            waiting_group = waiting_groups[i]
+            if waiting_group.is_finished():
+                del waiting_groups[i]
+                continue
+            # Remove the request.
+            for seq in waiting_group.get_seqs():
+                if seq.is_finished():
+                    continue
+                if self.partial_rollout_mode == "recompute": # recompute
+                    seq.status = SequenceStatus.WAITING
+                    seq.reset_state_for_recompute()
+                    self.free_seq(seq)
+                else: # swap out
+                    seq.status = SequenceStatus.SWAPPED
+            if self.partial_rollout_mode == "recompute":
+                self._free_seq_group_cross_attn_blocks(waiting_group)
+            else: # swap out
+                self._swap_out(waiting_group, self.partial_rollout_blocks_to_swap_out)
         
-    def has_unfinished_requests(self) -> None:
-        if self.partial_rollout_enable:
-            res = False 
-            for seq_group in self.running:
-                if not seq_group.request_id in self.sequence_group_rollout_steps:
-                    return True
-                elif self.sequence_group_rollout_steps[seq_group.request_id] < self.partial_rollout_save_steps:
-                    return True
-            return len(self.waiting) > 0 or len(self.swapped) > 0
-        return True
+        self.partial.extend(waiting_groups)
+
+    def has_unfinished_seqs(self) -> bool:
+        return len(self.waiting) != 0 or len(self.running) != 0 or len(
+            self.swapped) != 0
+
+    def transfer_partial_to_waiting(self) -> None:
+        self.waiting.extend(self.partial)
+        self.partial.clear()
+        
+    def transfer_partial_to_swapped(self) -> None:
+        self.swapped.extend(self.partial)
+        self.partial.clear()
+
+    def sorted_partial_seq_groups(self) -> List[SequenceGroup]:
+        # NOTE: this function will clear self.partial
+        ret = sorted(list(self.partial), key=lambda x: int(x.request_id))
+        self.partial.clear()
+        return ret
+
+    def add_partial_seq_group(self, seq_group: SequenceGroup) -> None:
+        self.partial.append(seq_group)
+        
+    def set_partial_rollout_mode(self, partial_rollout_mode: Optional[str]) -> None:
+        self.partial_rollout_mode = partial_rollout_mode
+
+    def get_and_reset_partial_rollout_blocks_to_swap_out(self) -> List[Tuple[int, int]]:
+        ret = [x for x in self.partial_rollout_blocks_to_swap_out]
+        self.partial_rollout_blocks_to_swap_out.clear()
+        return ret
