@@ -276,8 +276,7 @@ class vLLMRollout(BaseRollout):
 
         # free vllm cache engine
         if self.config.free_cache_engine:
-            if self.config.partial_rollout_mode != "reuse":
-                self.inference_engine.free_cache_engine()
+            self.inference_engine.free_cache_engine()
 
         if partial_rollout_enable:
             output_proto = DataProto(batch=batch)
