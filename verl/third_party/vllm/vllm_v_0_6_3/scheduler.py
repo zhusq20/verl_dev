@@ -188,6 +188,10 @@ class Scheduler(Scheduler):
             if waiting_group.is_finished():
                 del waiting_groups[i]
                 continue
+            if self.partial_rollout_mode == "recompute":
+                self._free_seq_group_cross_attn_blocks(waiting_group)
+            else: # swap out
+                self._swap_out(waiting_group, self.partial_rollout_blocks_to_swap_out)
             # Remove the request.
             for seq in waiting_group.get_seqs():
                 if seq.is_finished():
@@ -198,10 +202,6 @@ class Scheduler(Scheduler):
                     self.free_seq(seq)
                 else: # swap out
                     seq.status = SequenceStatus.SWAPPED
-            if self.partial_rollout_mode == "recompute":
-                self._free_seq_group_cross_attn_blocks(waiting_group)
-            else: # swap out
-                self._swap_out(waiting_group, self.partial_rollout_blocks_to_swap_out)
         
         self.partial.extend(waiting_groups)
 
@@ -230,6 +230,6 @@ class Scheduler(Scheduler):
         self.partial_rollout_mode = partial_rollout_mode
 
     def get_and_reset_partial_rollout_blocks_to_swap_out(self) -> List[Tuple[int, int]]:
-        ret = [x for x in self.partial_rollout_blocks_to_swap_out]
-        self.partial_rollout_blocks_to_swap_out.clear()
+        ret = self.partial_rollout_blocks_to_swap_out
+        self.partial_rollout_blocks_to_swap_out = list()
         return ret
