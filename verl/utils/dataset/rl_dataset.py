@@ -150,6 +150,7 @@ class RLHFDataset(Dataset):
         row_dict['input_ids'] = input_ids[0]
         row_dict['attention_mask'] = attention_mask[0]
         row_dict['position_ids'] = position_ids[0]
+        row_dict['reason'] = torch.tensor([-1])
 
         # encode prompts without chat template
         if self.return_raw_chat:

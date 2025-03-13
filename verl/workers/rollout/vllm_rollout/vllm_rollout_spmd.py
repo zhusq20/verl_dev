@@ -124,7 +124,7 @@ class vLLMRollout(BaseRollout):
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
 
-        print(f"kwargs: {kwargs}")
+        # print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
@@ -233,3 +233,122 @@ class vLLMRollout(BaseRollout):
             self.inference_engine.free_cache_engine()
 
         return DataProto(batch=batch)
+
+    @torch.no_grad()
+    def generate_sequences_partial(self, prompts: DataProto, **kwargs) -> DataProto:
+        # rebuild vllm cache engine
+        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+            self.inference_engine.init_cache_engine()
+
+        idx = prompts.batch['input_ids']  # (bs, prompt_length)
+        # left-padded attention_mask
+        attention_mask = prompts.batch['attention_mask']
+        position_ids = prompts.batch['position_ids']
+        reason_tensor = prompts.batch['reason']
+        # print("reason.shape", reason_tensor.shape)
+        assert reason_tensor.shape[1] == 1
+        assert reason_tensor.shape[0] == idx.shape[0]
+
+        # used to construct attention_mask
+        eos_token_id = prompts.meta_info['eos_token_id']
+
+        batch_size = idx.size(0)
+
+        idx_list = []
+        # parse idx from torch.Tensor to List[List[str]]
+        for i in range(batch_size):
+            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
+
+        do_sample = prompts.meta_info.get('do_sample', True)
+        if not do_sample:
+            kwargs = {
+                'best_of': 1,
+                'top_p': 1.0,
+                'top_k': -1,
+                'min_p': 0.0,
+                'temperature': 0,
+                'n': 1  # if greedy, only 1 response
+            }
+
+        # users can customize different sampling_params at different run
+        with self.update_sampling_params(**kwargs):
+            sampling_params = [self.sampling_params] * batch_size
+            for i in range(batch_size):
+                if int(reason_tensor[i]) == 1:
+                    sampling_params[i].n = 1 
+            outputs = self.inference_engine.generate(
+                prompts=None,  # because we have already convert it to prompt token id
+                sampling_params=sampling_params,
+                prompt_token_ids=idx_list,
+                use_tqdm=True)
+
+        # TODO(sgm): disable logprob when recompute_log_prob is enable
+        # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+
+        response = []
+        reason = []
+        n_sampling_list = []
+        for output in outputs:
+            # 为什么呢?
+            n_sampling_list.append(len(output.outputs))
+
+            for sample_id in range(len(output.outputs)):
+                response.append(output.outputs[sample_id].token_ids)
+                reason.append(output.outputs[sample_id].finish_reason=='length')
+        print("response shape version1:", len(response), "output length", len(outputs))
+        reason_tensor_after_gen = torch.tensor(reason, dtype=torch.int).unsqueeze(1).to(idx.device)
+        response = pad_2d_list_to_length(response, self.pad_token_id,
+                                         max_length=self.config.response_length).to(idx.device)
+        print("response shape version2:", response.shape)
+        # ?? response length是什么
+
+        assert idx.shape[0] == reason_tensor.shape[0], f"idx.shape[0]: {idx.shape[0]}, reason_tensor.shape[0]: {reason_tensor.shape[0]}"
+        if self.config.n > 1 and do_sample:
+            # 计算每个样本的复制次数
+            # 计算repeat_counts (shape=[batch_size])
+            # repeat_counts = torch.where(reason_tensor == 1, torch.tensor(1), torch.tensor(self.config.n)).flatten()
+            repeat_counts = torch.tensor(n_sampling_list, dtype=torch.int, device=idx.device).flatten()
+            print("repeat_counts response", repeat_counts.shape, len(response))
+            assert sum(repeat_counts) == len(response), f"sum(repeat_counts): {sum(repeat_counts)}, len(response): {len(response)}"
+            # print("repeat_counts", repeat_counts.shape, repeat_counts)
+            idx = idx.repeat_interleave(repeat_counts, dim=0)
+            # print("idx", idx.shape)
+            attention_mask = attention_mask.repeat_interleave(repeat_counts, dim=0)
+            position_ids = position_ids.repeat_interleave(repeat_counts, dim=0)
+            batch_size = idx.shape[0]
+        # print("idx shape:", idx.shape)
+        # print("response shape:", response.shape)
+        assert idx.shape[0] == response.shape[0], f"idx.shape[0]: {idx.shape[0]}, response.shape[0]: {response.shape[0]}"
+        seq = torch.cat([idx, response], dim=-1)
+
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+
+        # TODO(sgm): fix position_ids on right_pad
+        # prompt: left pad + response: right pad
+        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+        response_position_ids = position_ids[:, -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        # all the tp ranks should contain the same data here. data in all ranks are valid
+        batch = TensorDict(
+            {
+                'prompts': idx,
+                'responses': response,
+                'input_ids': seq,  # here input_ids become the whole sentences
+                # 'old_log_probs': log_probs, # we will recompute old log prob with actor
+                'attention_mask': attention_mask,
+                'position_ids': position_ids,
+                'reason': reason_tensor_after_gen,
+            },
+            batch_size=batch_size)
+
+        # free vllm cache engine
+        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+            self.inference_engine.free_cache_engine()
+
+        return DataProto(batch=batch), n_sampling_list

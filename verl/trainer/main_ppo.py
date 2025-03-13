@@ -14,7 +14,7 @@
 """
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer_v2, RayPPOTrainer, RayPPOTrainer_v3
 
 import ray
 import hydra
@@ -73,30 +73,30 @@ def main_task(config, compute_score=None):
         Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
     }
 
-    actor_pool_id= 'actor_pool_id'
-    critic_pool_id = 'critic_pool_id'
-    policy_pool_id = 'policy_pool_id'
-    resource_pool_spec = {
-    actor_pool_id: [8],
-    # critic_pool_id: [4],
-    # policy_pool_id: [2],
-    }
-    
-    mapping = {
-    Role.ActorRollout: actor_pool_id,
-    Role.Critic: actor_pool_id,
-    Role.RefPolicy: actor_pool_id,
-    }
-
-    # global_pool_id = 'global_pool'
+    # actor_pool_id= 'actor_pool_id'
+    # critic_pool_id = 'critic_pool_id'
+    # policy_pool_id = 'policy_pool_id'
     # resource_pool_spec = {
-    #     global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+    # actor_pool_id: [8],
+    # # critic_pool_id: [4],
+    # # policy_pool_id: [2],
     # }
+    
     # mapping = {
-    #     Role.ActorRollout: global_pool_id,
-    #     Role.Critic: global_pool_id,
-    #     Role.RefPolicy: global_pool_id,
+    # Role.ActorRollout: actor_pool_id,
+    # Role.Critic: actor_pool_id,
+    # Role.RefPolicy: actor_pool_id,
     # }
+
+    global_pool_id = 'global_pool'
+    resource_pool_spec = {
+        global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+    }
+    mapping = {
+        Role.ActorRollout: global_pool_id,
+        Role.Critic: global_pool_id,
+        Role.RefPolicy: global_pool_id,
+    }
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score
@@ -129,8 +129,9 @@ def main_task(config, compute_score=None):
     val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
-
-    trainer = RayPPOTrainer(config=config,
+    
+    # print("config", config)
+    trainer = RayPPOTrainer_v3(config=config,
                             tokenizer=tokenizer,
                             role_worker_mapping=role_worker_mapping,
                             resource_pool_manager=resource_pool_manager,

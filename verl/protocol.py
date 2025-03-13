@@ -15,7 +15,6 @@
 Implement base data transfer protocol between any two functions, modules.
 We can subclass Protocol to define more detailed batch info with specific keys
 """
-
 import pickle
 import numpy as np
 import pandas as pd
@@ -104,8 +103,11 @@ def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
     output = {key: [] for key in keys}
     for data in list_of_dict:
         for key, item in data.items():
-            assert key in output
-            output[key].append(item)
+            """hack for now"""
+            """如果"""
+            # assert key in output
+            if key in output:
+                output[key].append(item)
     return output
 
 
@@ -267,8 +269,9 @@ class DataProto:
                 assert isinstance(
                     val, np.ndarray
                 ) and val.dtype == object, 'data in the non_tensor_batch must be a numpy.array with dtype=object'
-                assert val.shape[
-                    0] == batch_size, f'key {key} length {len(val)} is not equal to batch size {batch_size}'
+                assert val.shape[0] == batch_size, f'key {key} length {len(val)} is not equal to batch size {batch_size}'
+                # if val.shape[0] != batch_size:
+                #     self.non_tensor_batch[key] = val[:batch_size]
 
     @classmethod
     def from_single_dict(cls, data: Dict[str, Union[torch.Tensor, np.ndarray]], meta_info=None):
@@ -488,6 +491,57 @@ class DataProto:
 
         return iter(get_data())
 
+
+    def partial_rollout(self, world_size) -> List['DataProto']:
+        """Split the batch among dim=0 into 2 chunks: first is completed, 2nd is cutoff by length."""
+        chunks = 2
+        if self.batch is not None:
+
+            # 假设 key_name 是你要用来划分的 key
+            key_name = "reason"
+
+            mask = (self.batch[key_name] == 1).squeeze(-1)  # 变成 [32]
+
+            # 直接使用视图，不进行复制
+            batch_true = self.batch[mask]
+            batch_false = self.batch[~mask]
+            batchsize = batch_false.batch_size[0]
+
+            # 计算需要保留的样本数量
+            trim_size = (batchsize // world_size) * world_size
+
+            batch_false = batch_false[:trim_size]
+
+            batch_lst = [batch_true, batch_false] # length , finished
+        else:
+            batch_lst = [None for _ in range(chunks)]
+
+        # 初始化两个非张量 batch
+        non_tensor_batch_true = {}
+        non_tensor_batch_false = {}
+        non_tensor_batch_lst = [{} for _ in range(chunks)]
+
+        # 遍历 self.non_tensor_batch 中的每个 key，按照 mask 进行分割
+        for key, val in self.non_tensor_batch.items():
+            assert isinstance(val, np.ndarray)
+            
+            # 按 mask 分割
+            non_tensor_batch_true[key] = val[mask.cpu().numpy()]
+            non_tensor_batch_false[key] = val[~mask.cpu().numpy()]
+            batchsize = non_tensor_batch_false[key].shape[0]
+            # 计算需要保留的样本数量
+            trim_size = (batchsize // world_size) * world_size
+            non_tensor_batch_false[key] = non_tensor_batch_false[key][:trim_size]
+        non_tensor_batch_lst = [non_tensor_batch_true, non_tensor_batch_false] # length , finished
+
+        output = []
+        for i in range(chunks):
+            output.append(
+                DataProto(batch=batch_lst[i], non_tensor_batch=non_tensor_batch_lst[i], meta_info=self.meta_info))
+
+        return output
+
+
     def chunk(self, chunks: int) -> List['DataProto']:
         """Split the batch among dim=0 into chunks. The meta_info is passed to each DataProto after split.
 
@@ -520,6 +574,112 @@ class DataProto:
 
         return output
 
+    
+    @staticmethod
+    def truncate_and_filter_batches(batch_lst, maxlen, pad_id):
+        mask_list = []
+        for i, batch in enumerate(batch_lst):
+            input_ids = batch['input_ids']
+            attention_mask = batch['attention_mask']
+            position_ids = batch['position_ids']
+            reason = batch['reason']
+
+            # 获取 batch_size 和 seq_len
+            batch_size, seq_len = input_ids.shape
+
+            # 截断到 maxlen
+            if seq_len > maxlen:
+                input_ids = input_ids[:, -maxlen:]
+                attention_mask = attention_mask[:, -maxlen:]
+                position_ids = position_ids[:, -maxlen:]
+
+            # 获取每个样本的左侧第一个元素
+            first_elements = input_ids[:, 0]
+
+            # 筛选：如果左侧第一个元素不是 pad_id，就移除
+            mask = first_elements == pad_id
+            input_ids = input_ids[mask]
+            attention_mask = attention_mask[mask]
+            position_ids = position_ids[mask]
+            reason = reason[mask]
+            mask_list.append(mask)
+            # 只有在 batch_size 仍然大于 0 时，才加入新的 batch
+            if input_ids.shape[0] > 0:
+                new_batch = {
+                    'input_ids': input_ids,
+                    'attention_mask': attention_mask,
+                    'position_ids': position_ids,
+                    'reason': reason
+                }
+                batch_lst[i] = TensorDict(source=new_batch, batch_size=(input_ids.shape[0],))
+            else:
+                batch_lst[i] = None  # 如果 batch 被完全筛除，则设为 None
+    
+        # 移除 None 元素，保持 batch_lst 的结构
+        batch_lst = [batch for batch in batch_lst if batch is not None]
+
+        return batch_lst, mask_list
+
+    @staticmethod
+    def concat_partial(max_len, pad_token_id, data: List['DataProto'], world_size: int) -> 'DataProto':
+        """Concat a list of DataProto. The batch is concatenated among dim=0.
+        The meta_info is assumed to be identical and will use the first one.
+
+        Args:
+            data (List[DataProto]): list of DataProto
+
+        Returns:
+            DataProto: concatenated DataProto
+        """
+        batch_lst = []
+        # 过滤掉没有 batch 的 DataProto, 针对self.replay_buffer和self.prompt_buffer
+        data = [d for d in data if d is not None and d.batch is not None]
+        for batch in data:
+            batch_lst.append(batch.batch)
+
+        batch_lst ,mask_lst = DataProto.truncate_and_filter_batches(batch_lst, max_len, pad_token_id)
+        if batch_lst[0] is not None:
+            new_batch = torch.cat(batch_lst, dim=0)
+        else:
+            new_batch = None
+
+        # truncate_and_filter_batches里面去掉了partial rollout中prompt+response < max_len的batch
+        # 所以这里的non_tensor_batch也要做相应的处理
+        for idx, d in enumerate(data):
+            assert mask_lst[idx].shape[0] == d.batch.batch_size[0], "mask shape not match"
+            for key, val in d.non_tensor_batch.items():
+                d.non_tensor_batch[key] = val[mask_lst[idx].cpu().numpy()]
+
+
+        # hack, 原batch在前面
+        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
+        for key, val in non_tensor_batch.items():
+            non_tensor_batch[key] = np.concatenate(val, axis=0)
+
+        if new_batch is not None:
+            total_len = new_batch.shape[0]
+            adjusted_len = (total_len // world_size) * world_size  # 向下取整，确保是 world_size 的整数倍
+
+            if adjusted_len == total_len:
+                remaining_batch = None
+                remaining_non_tensor_batch = None
+            else:
+                remaining_batch = new_batch[:-adjusted_len]
+                new_batch = new_batch[-adjusted_len:]
+
+                remaining_non_tensor_batch = {key: val[:-adjusted_len] for key, val in non_tensor_batch.items()}
+                non_tensor_batch = {key: val[-adjusted_len:] for key, val in non_tensor_batch.items()}
+
+        else:
+            remaining_batch = None
+            remaining_non_tensor_batch = None
+
+        adjusted_data = DataProto(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=data[0].meta_info)
+        remaining_data = DataProto(batch=remaining_batch, non_tensor_batch=remaining_non_tensor_batch, meta_info=data[0].meta_info) if remaining_batch is not None else None
+
+        return adjusted_data, remaining_data
+
+
     @staticmethod
     def concat(data: List['DataProto']) -> 'DataProto':
         """Concat a list of DataProto. The batch is concatenated among dim=0.
@@ -538,11 +698,9 @@ class DataProto:
             new_batch = torch.cat(batch_lst, dim=0)
         else:
             new_batch = None
-
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
         for key, val in non_tensor_batch.items():
             non_tensor_batch[key] = np.concatenate(val, axis=0)
-
         return DataProto(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=data[0].meta_info)
 
     def reorder(self, indices):
@@ -553,7 +711,7 @@ class DataProto:
         self.batch = self.batch[indices]
         self.non_tensor_batch = {key: val[indices_np] for key, val in self.non_tensor_batch.items()}
 
-    def repeat(self, repeat_times=2, interleave=True):
+    def repeat(self, repeat_times=2, interleave=True, n_sampling_list=None):
         """
         Repeat the batch data a specified number of times.
 
@@ -565,31 +723,44 @@ class DataProto:
             DataProto: A new DataProto with repeated data.
         """
         if self.batch is not None:
-            if interleave:
-                # Interleave the data
+            if n_sampling_list is not None and interleave:
+                repeat_mask = torch.tensor(n_sampling_list, device=self.batch.device).flatten()
                 repeated_tensors = {
-                    key: tensor.repeat_interleave(repeat_times, dim=0) for key, tensor in self.batch.items()
+                    key: tensor.repeat_interleave(repeat_mask, dim=0) for key, tensor in self.batch.items()
                 }
-            else:
-                # Stack the data
-                repeated_tensors = {
-                    key: tensor.unsqueeze(0).expand(repeat_times, *tensor.shape).reshape(-1, *tensor.shape[1:])
-                    for key, tensor in self.batch.items()
-                }
-
-            repeated_batch = TensorDict(
+                repeated_batch = TensorDict(
                 source=repeated_tensors,
-                batch_size=(self.batch.batch_size[0] * repeat_times,),
-            )
+                batch_size=(sum(repeat_mask),),
+                )
+            else:
+                if interleave:
+                    # Interleave the data
+                    repeated_tensors = {
+                        key: tensor.repeat_interleave(repeat_times, dim=0) for key, tensor in self.batch.items()
+                    }
+                else:
+                    # Stack the data
+                    repeated_tensors = {
+                        key: tensor.unsqueeze(0).expand(repeat_times, *tensor.shape).reshape(-1, *tensor.shape[1:])
+                        for key, tensor in self.batch.items()
+                    }
+
+                repeated_batch = TensorDict(
+                    source=repeated_tensors,
+                    batch_size=(self.batch.batch_size[0] * repeat_times,),
+                )
         else:
             repeated_batch = None
 
         repeated_non_tensor_batch = {}
         for key, val in self.non_tensor_batch.items():
-            if interleave:
-                repeated_non_tensor_batch[key] = np.repeat(val, repeat_times, axis=0)
+            if n_sampling_list is not None and interleave:
+                repeated_non_tensor_batch[key] = np.repeat(val, np.array(n_sampling_list), axis=0)
             else:
-                repeated_non_tensor_batch[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
+                if interleave:
+                    repeated_non_tensor_batch[key] = np.repeat(val, repeat_times, axis=0)
+                else:
+                    repeated_non_tensor_batch[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
 
         return DataProto(
             batch=repeated_batch,

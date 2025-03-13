@@ -450,6 +450,54 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         return output
 
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def generate_sequences_partial(self, prompts: DataProto):
+        prompts = prompts.to('cuda')
+        assert self._is_rollout
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        prompts.batch = prompts.batch.cuda()
+        meta_info = {
+            'eos_token_id':
+                self.generation_config.eos_token_id
+                if self.generation_config is not None else self.tokenizer.eos_token_id,
+            'pad_token_id':
+                self.generation_config.pad_token_id
+                if self.generation_config is not None else self.tokenizer.pad_token_id,
+        }
+        prompts.meta_info.update(meta_info)
+        
+        with self.rollout_sharding_manager:
+
+            # after parameters sync with rollout, offload actor model to CPU
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
+            log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+            with Timer(name='rollout', logger=None) as timer:
+                output, n_sampling_list = self.rollout.generate_sequences_partial(prompts=prompts)
+            delta_time = timer.last
+            log_gpu_memory_usage('After rollout generation', logger=logger)
+
+            output = self.rollout_sharding_manager.postprocess_data(output)
+
+
+        output = output.to('cpu')
+        output.meta_info["rollout_time"]=delta_time
+        
+        # clear kv cache
+        torch.cuda.empty_cache()
+        log_gpu_memory_usage('After recompute log prob', logger=logger)
+        # prof.step()
+        print("what is the output?",output[0])
+        # prof.stop()
+        return output, n_sampling_list
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         prompts = prompts.to('cuda')
@@ -467,18 +515,6 @@ class ActorRolloutRefWorker(Worker):
                 if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        # prof = torch.profiler.profile(
-        #         activities=[
-        #             torch.profiler.ProfilerActivity.CPU,
-        #             torch.profiler.ProfilerActivity.CUDA,
-        #             ],
-        #         on_trace_ready=torch.profiler.tensorboard_trace_handler('/workspace/verlpy310/log/grpo_0228'),
-        #         record_shapes=True,
-        #         profile_memory=True,
-        #         with_stack=True,
-        #         with_flops=True
-        # )
-        # prof.start()
         
         with self.rollout_sharding_manager:
 
@@ -501,14 +537,15 @@ class ActorRolloutRefWorker(Worker):
         output = output.to('cpu')
         output.meta_info["rollout_time"]=delta_time
         
-        if self._is_offload_param:
-            # NOTE(sgm): the grad is already in CPU, only offload param here
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+        # if self._is_offload_param:
+        #     # NOTE(sgm): the grad is already in CPU, only offload param here
+        #     offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         # prof.step()
         # prof.stop()
+        print("what is the output?",output[0])
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -896,6 +933,10 @@ class CriticWorker(Worker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.critic_optimizer)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def count_flops_critic(self, prompt, response, delta_time: float):
+        a,b,c= self.flops_counter.estimate_flops_critic(prompt, response, delta_time)
+        return a,b,c
 
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py
