@@ -295,29 +295,21 @@ class vLLMRollout(BaseRollout):
             for sample_id in range(len(output.outputs)):
                 response.append(output.outputs[sample_id].token_ids)
                 reason.append(output.outputs[sample_id].finish_reason=='length')
-        print("response shape version1:", len(response), "output length", len(outputs))
         reason_tensor_after_gen = torch.tensor(reason, dtype=torch.int).unsqueeze(1).to(idx.device)
         response = pad_2d_list_to_length(response, self.pad_token_id,
                                          max_length=self.config.response_length).to(idx.device)
-        print("response shape version2:", response.shape)
         # ?? response length是什么
 
         assert idx.shape[0] == reason_tensor.shape[0], f"idx.shape[0]: {idx.shape[0]}, reason_tensor.shape[0]: {reason_tensor.shape[0]}"
         if self.config.n > 1 and do_sample:
             # 计算每个样本的复制次数
-            # 计算repeat_counts (shape=[batch_size])
-            # repeat_counts = torch.where(reason_tensor == 1, torch.tensor(1), torch.tensor(self.config.n)).flatten()
             repeat_counts = torch.tensor(n_sampling_list, dtype=torch.int, device=idx.device).flatten()
-            print("repeat_counts response", repeat_counts.shape, len(response))
             assert sum(repeat_counts) == len(response), f"sum(repeat_counts): {sum(repeat_counts)}, len(response): {len(response)}"
-            # print("repeat_counts", repeat_counts.shape, repeat_counts)
             idx = idx.repeat_interleave(repeat_counts, dim=0)
-            # print("idx", idx.shape)
             attention_mask = attention_mask.repeat_interleave(repeat_counts, dim=0)
             position_ids = position_ids.repeat_interleave(repeat_counts, dim=0)
             batch_size = idx.shape[0]
-        # print("idx shape:", idx.shape)
-        # print("response shape:", response.shape)
+            
         assert idx.shape[0] == response.shape[0], f"idx.shape[0]: {idx.shape[0]}, response.shape[0]: {response.shape[0]}"
         seq = torch.cat([idx, response], dim=-1)
 
@@ -334,6 +326,16 @@ class vLLMRollout(BaseRollout):
         response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
+        # 计算每个索引 i 对应的区间边界
+        cumsum_a = torch.tensor(n_sampling_list).cumsum(0)  # 计算累积和
+        question_number = torch.empty(sum(n_sampling_list), dtype=torch.int).unsqueeze(1).to(idx.device)
+
+        # 填充 b
+        start = 0
+        for i, end in enumerate(cumsum_a):
+            question_number[start:end] = i
+            start = end
+
         # all the tp ranks should contain the same data here. data in all ranks are valid
         batch = TensorDict(
             {
@@ -344,6 +346,7 @@ class vLLMRollout(BaseRollout):
                 'attention_mask': attention_mask,
                 'position_ids': position_ids,
                 'reason': reason_tensor_after_gen,
+                'question_number': question_number
             },
             batch_size=batch_size)
 
@@ -351,4 +354,4 @@ class vLLMRollout(BaseRollout):
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
 
-        return DataProto(batch=batch), n_sampling_list
+        return DataProto(batch=batch)

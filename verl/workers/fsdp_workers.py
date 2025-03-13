@@ -138,7 +138,7 @@ class ActorRolloutRefWorker(Worker):
             self.config.ref.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
                                                            self.ulysses_sequence_parallel_size)
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
-
+        self.n_sampling_list = None
     def _build_model_optimizer(self,
                                model_path,
                                fsdp_config,
@@ -480,7 +480,7 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             with Timer(name='rollout', logger=None) as timer:
-                output, n_sampling_list = self.rollout.generate_sequences_partial(prompts=prompts)
+                output = self.rollout.generate_sequences_partial(prompts=prompts)
             delta_time = timer.last
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
@@ -494,9 +494,9 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         # prof.step()
-        print("what is the output?",output[0])
+        # print("what is the output?",output[0])
         # prof.stop()
-        return output, n_sampling_list
+        return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
@@ -644,6 +644,10 @@ class ActorRolloutRefWorker(Worker):
     def count_flops_rollout(self, prompt_length, response_length, delta_time):
         a,b,c = self.flops_counter.estimate_flops_rollout(prompt_length, response_length, delta_time)
         return a, b, c
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_n_sampling_list(self):
+        return self.n_sampling_list
          
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

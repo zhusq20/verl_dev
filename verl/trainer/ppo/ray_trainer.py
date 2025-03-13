@@ -2362,7 +2362,8 @@ class RayPPOTrainer_v3(object):
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
-                        gen_batch_output, n_sampling_list = self.actor_rollout_wg.generate_sequences_partial(gen_batch)
+                        gen_batch_output = self.actor_rollout_wg.generate_sequences_partial(gen_batch)
+                        # n_sampling_list = self.actor_rollout_wg.get_n_sampling_list()[0]
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer('gen_max', timing_raw):
@@ -2380,9 +2381,10 @@ class RayPPOTrainer_v3(object):
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    
+                    question_number = gen_batch_output.batch['question_number']
+                    print("question_number",question_number.shape)
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True, n_sampling_list=n_sampling_list)
+                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True, question_number=question_number)
                     batch = batch.union(gen_batch_output)
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)

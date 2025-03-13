@@ -711,7 +711,7 @@ class DataProto:
         self.batch = self.batch[indices]
         self.non_tensor_batch = {key: val[indices_np] for key, val in self.non_tensor_batch.items()}
 
-    def repeat(self, repeat_times=2, interleave=True, n_sampling_list=None):
+    def repeat(self, repeat_times=2, interleave=True, question_number=None):
         """
         Repeat the batch data a specified number of times.
 
@@ -722,9 +722,20 @@ class DataProto:
         Returns:
             DataProto: A new DataProto with repeated data.
         """
+        # 计算 a
+        # print("question_number.shape", question_number)
+        # a = torch.bincount(question_number.view(-1))
+        # print("a.shape", a)
+
+        # 计算变化的位置
+        change_indices = torch.where(question_number[1:] != question_number[:-1])[0] + 1
+
+        # 计算每个连续段的长度
+        a = torch.diff(torch.cat((torch.tensor([0]), change_indices, torch.tensor([question_number.numel()]))))
+        print("a.shape", a)
         if self.batch is not None:
-            if n_sampling_list is not None and interleave:
-                repeat_mask = torch.tensor(n_sampling_list, device=self.batch.device).flatten()
+            if a is not None and interleave:
+                repeat_mask = a
                 repeated_tensors = {
                     key: tensor.repeat_interleave(repeat_mask, dim=0) for key, tensor in self.batch.items()
                 }
@@ -754,8 +765,10 @@ class DataProto:
 
         repeated_non_tensor_batch = {}
         for key, val in self.non_tensor_batch.items():
-            if n_sampling_list is not None and interleave:
-                repeated_non_tensor_batch[key] = np.repeat(val, np.array(n_sampling_list), axis=0)
+            if a is not None and interleave:
+                # 这里好像把question_number复制了n=gpus份
+                assert val.shape[0] == a.shape[0], f"val.shape[0] != a.shape[0], {val.shape[0]} != {a.shape[0]}"
+                repeated_non_tensor_batch[key] = np.repeat(val, a.cpu().numpy(), axis=0)
             else:
                 if interleave:
                     repeated_non_tensor_batch[key] = np.repeat(val, repeat_times, axis=0)
