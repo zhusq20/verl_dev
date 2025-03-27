@@ -209,7 +209,12 @@ def allgather_dict_tensors(tensors: Union[Dict[str, torch.Tensor], TensorDict], 
     sorted_keys = sorted(tensors_as_dict.keys())
     for key in sorted_keys:
         val = tensors_as_dict[key]
-        output[key] = [torch.empty_like(val) for _ in range(size)]
+        # output[key] = [torch.empty_like(val) for _ in range(size)]
+        try:
+            output[key] = [torch.empty_like(val) for _ in range(size)]
+        except TypeError as e:
+            print(f"[TypeError] key = {key}, type = {type(val)}, error = {e}")
+            raise  # 可选：如果你想让程序继续报错退出的话
         torch.distributed.all_gather(output[key], val, group=group, async_op=False)
         output[key] = torch.cat(output[key], dim=dim)
 
@@ -235,6 +240,23 @@ def pad_2d_list_to_length(response, pad_token_id, max_length=None):
     else:
         target_length = response_length
     padded_response = [tuple(sub_list) + (pad_token_id,) * (target_length - len(sub_list)) for sub_list in response]
+    tensor = torch.tensor(padded_response)
+    return tensor
+
+def pad_2d_list_to_length_dirercted(response, pad_token_id, max_length=None, left_pad=False):
+    """
+    pad a 2D list (e.g. responses, logprobs) to a 2D tensor.
+    """
+    response_length = max(len(sub_list) for sub_list in response)
+    if max_length is not None and max_length > response_length:
+        target_length = max_length
+    else:
+        target_length = response_length
+    if not left_pad:
+        padded_response = [tuple(sub_list) + (pad_token_id,) * (target_length - len(sub_list)) for sub_list in response]
+    else:
+        padded_response = [(pad_token_id,) * (target_length - len(sub_list)) + tuple(sub_list) for sub_list in response]
+    # padded_response = [tuple(sub_list) + (pad_token_id,) * (target_length - len(sub_list)) for sub_list in response]
     tensor = torch.tensor(padded_response)
     return tensor
 

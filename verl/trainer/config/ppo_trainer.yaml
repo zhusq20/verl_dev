@@ -65,6 +65,7 @@ actor_rollout_ref:
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
   rollout:
+    use_partial_rollout: True
     name: vllm
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
@@ -72,6 +73,7 @@ actor_rollout_ref:
     use_fire_sampling: False # https://arxiv.org/abs/2410.21236
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
+    partial_rollout_length: ${data.max_response_length}
     # for vllm rollout
     dtype: bfloat16 # should align with FSDP
     gpu_memory_utilization: 0.5

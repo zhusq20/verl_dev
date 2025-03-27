@@ -163,6 +163,9 @@ class vLLMRollout(BaseRollout):
         # left-padded attention_mask
         attention_mask = prompts.batch['attention_mask']
         position_ids = prompts.batch['position_ids']
+        # is_partial = prompts.batch.get('is_partial', False)
+        # if not is_partial:
+        #     is_partial = torch.zeros((idx.size(0),), dtype=torch.bool, device=idx.device)
 
         # used to construct attention_mask
         eos_token_id = prompts.meta_info['eos_token_id']
@@ -201,6 +204,7 @@ class vLLMRollout(BaseRollout):
                 sampling_params=self.sampling_params,
                 prompt_token_ids=idx_list,
                 use_tqdm=False)
+            print(f"output: {output}")
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
@@ -241,6 +245,7 @@ class vLLMRollout(BaseRollout):
                 # 'old_log_probs': log_probs, # we will recompute old log prob with actor
                 'attention_mask': attention_mask,
                 'position_ids': position_ids
+                "is_partial": 
             },
             batch_size=batch_size)
 

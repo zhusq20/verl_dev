@@ -84,6 +84,7 @@ class RLHFDataset(Dataset):
                  prompt_key='prompt',
                  image_key='images',
                  max_prompt_length=1024,
+                 max_response_length=1024,
                  filter_prompts=True,
                  cache_dir='~/.cache/verl/rlhf',
                  chat_template_func=None,
@@ -102,6 +103,8 @@ class RLHFDataset(Dataset):
         self.prompt_key = prompt_key
         self.image_key = image_key
         self.max_prompt_length = max_prompt_length
+        self.max_response_length = max_response_length
+
         self.filter_prompts = filter_prompts
 
         self.return_raw_chat = return_raw_chat
@@ -211,6 +214,8 @@ class RLHFDataset(Dataset):
         row_dict['attention_mask'] = attention_mask[0]
         row_dict['position_ids'] = position_ids[0]
         row_dict['raw_prompt_ids'] = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        # print(len(row_dict['raw_prompt_ids']), "is this!")
+        row_dict['raw_response_ids'] = [151643] * self.max_response_length  # dummy response
 
         # encode prompts without chat template
         if self.return_raw_chat:

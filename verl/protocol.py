@@ -72,14 +72,27 @@ def unpad_dataproto(data: 'DataProto', pad_size):
 
 def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> TensorDict:
     """Union two tensordicts."""
+    print("type(tensor_dict1), type(tensor_dict2)", type(tensor_dict1), type(tensor_dict2))
+    assert isinstance(tensor_dict1, TensorDict), 'tensor_dict1 must be a TensorDict, {tensor_dict1.keys()}'
+    assert isinstance(tensor_dict2, TensorDict), 'tensor_dict2 must be a TensorDict, {tensor_dict2.keys()}'
     assert tensor_dict1.batch_size == tensor_dict2.batch_size, \
         f'Two tensor dict must have identical batch size. Got {tensor_dict1.batch_size} and {tensor_dict2.batch_size}'
     for key in tensor_dict2.keys():
         if key not in tensor_dict1.keys():
             tensor_dict1[key] = tensor_dict2[key]
         else:
-            assert tensor_dict1[key].equal(tensor_dict2[key]), \
-                f'{key} in tensor_dict1 and tensor_dict2 are not the same object'
+            # if key == "input_ids" or key == "attention_mask" or key == "position_ids":
+            #     assert tensor_dict1[key].shape[0] == tensor_dict2[key].shape[0], \
+            #         f'{key} in tensor_dict1 and tensor_dict2 are not the same length'
+            #     if tensor_dict1[key].shape[1] < tensor_dict2[key].shape[1]:
+            #         tensor_dict1[key] = tensor_dict2[key]
+            # elif key == "is_partial":
+            #     assert tensor_dict1[key].shape[0] == tensor_dict2[key].shape[0], \
+            #         f'{key} in tensor_dict1 and tensor_dict2 are not the same length'
+            #     tensor_dict1[key] = tensor_dict2[key]
+            # else:
+              assert tensor_dict1[key].equal(tensor_dict2[key]), \
+                f'{key} in tensor_dict1 and tensor_dict2 are not the same object {tensor_dict1[key][0]} and {tensor_dict2[key][0]}'
 
     return tensor_dict1
 
@@ -104,7 +117,7 @@ def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
     output = {key: [] for key in keys}
     for data in list_of_dict:
         for key, item in data.items():
-            assert key in output
+            assert key in output, f'key {key} not in the first dict'
             output[key].append(item)
     return output
 
@@ -168,6 +181,27 @@ class DataProtoItem:
     non_tensor_batch: Dict = field(default_factory=dict)
     meta_info: Dict = field(default_factory=dict)
 
+
+
+import numpy as np
+
+def pad_and_concat(arrays, axis=0, pad_value=0):
+    """
+    将形状不同的2D数组列表pad成统一形状后拼接
+    """
+    ndim = arrays[0].ndim
+    assert all(arr.ndim == ndim for arr in arrays), "所有数组维度必须相同"
+
+    # 获取所有数组的目标形状
+    max_shape = list(np.max([arr.shape for arr in arrays], axis=0))
+
+    padded = []
+    for arr in arrays:
+        pad_width = [(0, max_shape[dim] - arr.shape[dim]) for dim in range(ndim)]
+        padded_arr = np.pad(arr, pad_width, mode='constant', constant_values=pad_value)
+        padded.append(padded_arr)
+
+    return np.concatenate(padded, axis=axis)
 
 @dataclass
 class DataProto:
@@ -539,8 +573,16 @@ class DataProto:
 
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
         for key, val in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(val, axis=0)
-
+            # if key == "raw_response_ids":
+            #     print(f"key: {key}, val: {val[0].shape}, real_val: {val[0]}")
+            try:
+                # if key == "raw_response_ids":
+                #     non_tensor_batch[key] = np.array([item for lst in val for item in lst], dtype=object)
+                # else:   
+                non_tensor_batch[key] = np.concatenate(val, axis=0)
+            except ValueError as e:
+                print(f"报错的key是: {key}")
+                raise e
         return DataProto(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=data[0].meta_info)
 
     def reorder(self, indices):
@@ -656,6 +698,12 @@ def all_gather_data_proto(data: DataProto, process_group):
     assert isinstance(data, DataProto)
     prev_device = data.batch.device
     data.batch = data.batch.cuda(device=torch.cuda.current_device())
+    print(f"all_gather_data_proto line698: {data.batch.keys()},data.non_tensor_batch.keys(): {data.non_tensor_batch.keys()}")
+    # if 'raw_response_ids' in data.batch:
+    #     data.non_tensor_batch['raw_response_ids'] = data.batch.pop('raw_response_ids')
+    # if 'raw_prompt_ids' in data.batch:
+    #     data.non_tensor_batch['raw_prompt_ids'] = data.batch.pop('raw_prompt_ids')
+    # print(f"all_gather_data_proto line701: {data.batch.keys()},data.non_tensor_batch.keys(): {data.non_tensor_batch.keys()}")
     data.batch = allgather_dict_tensors(data.batch.contiguous(), size=group_size, group=process_group, dim=0)
     data.batch = data.batch.to(prev_device)
     # all gather non_tensor_batch

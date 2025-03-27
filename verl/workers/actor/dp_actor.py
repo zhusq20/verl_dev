@@ -65,6 +65,7 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs: # (bs, response_len)
         """
         response_length = micro_batch['responses'].size(-1)
+        # print(f'what is your shape? response_length: {response_length}')
         multi_modal_inputs = {}
         if 'multi_modal_inputs' in micro_batch:
             for key in micro_batch['multi_modal_inputs'][0].keys():
@@ -73,6 +74,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             input_ids = micro_batch['input_ids']
+            # print(f'what is your shape? input_ids: {input_ids.shape}')
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch['attention_mask']
             position_ids = micro_batch['position_ids']
@@ -143,6 +145,8 @@ class DataParallelPPOActor(BasePPOActor):
                 # only return response part:
                 entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
+                # print(f'what is your shape? log_probs: {log_probs.shape}')
+                # print(f'what is your shape? entropy: {entropy.shape}')
 
             else:  # not using rmpad and no ulysses sp
                 output = self.actor_module(input_ids=input_ids,
@@ -153,6 +157,7 @@ class DataParallelPPOActor(BasePPOActor):
                 logits = output.logits
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
+                # print(f'what is your shape? logits: {logits.shape}')
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
                 entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
@@ -223,7 +228,7 @@ class DataParallelPPOActor(BasePPOActor):
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
-
+        print(f'log_probs: {log_probs.shape}')
         return log_probs
 
     def update_policy(self, data: DataProto):
