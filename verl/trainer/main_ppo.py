@@ -14,7 +14,7 @@
 """
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_trainer_vanilla import RayPPOTrainer
 
 import os
 import ray
@@ -107,7 +107,7 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
+        from verl.trainer.ppo.ray_trainer_vanilla import ResourcePoolManager, Role
 
         role_worker_mapping = {
             Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
