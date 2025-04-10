@@ -40,6 +40,7 @@ class Dispatch(Enum):
 class Execute(Enum):
     ALL = 0
     RANK_ZERO = 1
+    RANK_DESIGNATED = 2
 
 
 def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
@@ -297,6 +298,42 @@ def collect_dp_compute_data_proto(worker_group, output):
     return _concat_data_proto_or_future(output)
 
 
+def dispatch_dp_compute_data_proto_designated(worker_group, *args, **kwargs):
+    from verl.single_controller.base.worker_group import WorkerGroup
+    assert isinstance(worker_group, WorkerGroup)
+    ranks = []
+    if 'ranks' in kwargs:
+        ranks.extend(kwargs['ranks'])
+        del kwargs['ranks']
+    if len(ranks) == 0:
+        raise RuntimeError(
+            "When using \'execute_rank_part\' as excution method "
+            "\'ranks\' must be a valid parameter."
+        )
+    splitted_args, splitted_kwargs = _split_args_kwargs_data_proto(len(ranks), *args, **kwargs)
+    splitted_kwargs['ranks'] = ranks
+    return splitted_args, splitted_kwargs
+
+
+def collect_dp_compute_designated(worker_group, output):
+    from verl.single_controller.base.worker_group import WorkerGroup
+    assert isinstance(worker_group, WorkerGroup)
+    # TODO: define a new parameter to get the length
+    # assert len(output) == worker_group.world_size
+    return output
+
+
+def collect_dp_compute_data_proto_designated(worker_group, output):
+    from verl.protocol import DataProto
+    import ray
+
+    for o in output:
+        assert isinstance(o, (DataProto, ray.ObjectRef)), f"expecting {o} to be DataProto, but got {type(o)}"
+
+    output = collect_dp_compute_designated(worker_group, output)
+    return _concat_data_proto_or_future(output)
+
+
 def get_predefined_dispatch_fn(dispatch_mode):
     predefined_dispatch_mode_fn = {
         Dispatch.ONE_TO_ALL: {
@@ -342,6 +379,10 @@ def get_predefined_dispatch_fn(dispatch_mode):
         Dispatch.DP_COMPUTE_METRIC: {
             'dispatch_fn': dispatch_dp_compute_data_proto,
             'collect_fn': collect_dp_compute
+        },
+        Dispathc.DP_COMPUTE_PROTO_DESIGNATED: {
+            'dispatch_fn': dispatch_dp_compute_data_proto_designated,
+            'collect_fn': collect_dp_compute_data_proto_designated
         }
     }
     return predefined_dispatch_mode_fn[dispatch_mode]
@@ -358,7 +399,10 @@ def get_predefined_execute_fn(execute_mode):
         },
         Execute.RANK_ZERO: {
             'execute_fn_name': 'execute_rank_zero'
-        }
+        },
+        Execute.RANK_DESIGNATED: {
+            'execute_fn_name': 'execute_rank_designated'
+        },
     }
     return predefined_execute_mode_fn[execute_mode]
 

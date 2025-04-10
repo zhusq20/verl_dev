@@ -219,6 +219,10 @@ def compute_data_metrics(batch, use_critic=True):
     prompt_length = response_info['prompt_length']
     response_length = response_info['response_length']
 
+    # with open("./output.txt", 'a') as f:
+    #     f.write(f"Response_length: {response_length.tolist()}")
+    #     f.close()
+
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
@@ -849,6 +853,9 @@ class RayPPOTrainer(object):
         self.global_steps += 1
         
         replay_buffer: DataProto = DataProto()
+        fuse_replay_buffer: DataProto = DataProto()
+        fuse_buffer: DataProto = DataProto()
+        overlapped_batch: DataProto = DataProto()
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -865,12 +872,17 @@ class RayPPOTrainer(object):
                 partial_rollout_enable = False
                 if self.config.actor_rollout_ref.rollout.partial_rollout_save_steps:
                     partial_rollout_enable = True
+                fuse_enable = self.config.trainer.fuse_enable
+                
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
-                gen_batch.meta_info = {
+                gen_batch.meta_info.update({
                     'partial_rollout_enable': partial_rollout_enable,
-                }
+                    'fuse_enable': fuse_enable,
+                })
 
                 with _timer('step', timing_raw):
+                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                                             dtype=object)
                     
                     # generate a batch
                     with _timer('gen', timing_raw):
@@ -892,16 +904,15 @@ class RayPPOTrainer(object):
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                             dtype=object)
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    if partial_rollout_enable:
+                    
+                    # save the unfinished seq_group to replay buffer
+                    if partial_rollout_enable or fuse_enable:
+                        output_finished = gen_batch_output.non_tensor_batch.pop("output_finished")
                         if len(replay_buffer) > 0:
                             batch = DataProto.concat([replay_buffer, batch])
                             replay_buffer = DataProto()
-                    if partial_rollout_enable:
-                        output_finished = gen_batch_output.meta_info["output_finished"]
                         selected_replay_index = []
                         finished_index = []
                         for index, finished in enumerate(output_finished.tolist()):
@@ -909,33 +920,99 @@ class RayPPOTrainer(object):
                                 finished_index.append(index)
                             else:
                                 selected_replay_index.append(index)
-                        # print(f"selected_replay_index length: {len(selected_replay_index)}, finished_index length: {len(finished_index)}")
-                        batch_dict = {}
-                        batch_replay = {}
-                        for key, value in batch.batch.items():
-                            batch_replay[key] = torch.index_select(value, dim=0, index=torch.IntTensor(selected_replay_index))
-                            batch_dict[key] = torch.index_select(value, dim=0, index=torch.IntTensor(finished_index))
-                        non_tensor_batch = {}
-                        non_tensor_batch_replay = {}
-                        for key, value in batch.non_tensor_batch.items():
-                            non_tensor_batch_replay[key] = value[selected_replay_index]
-                            non_tensor_batch[key] = value[finished_index]
-                        batch = DataProto(batch=TensorDict(batch_dict, batch_size=len(finished_index)),
-                                          non_tensor_batch=non_tensor_batch,
-                                          meta_info=batch.meta_info)
-                        replay_buffer = DataProto(batch=TensorDict(batch_replay, batch_size=len(selected_replay_index)),
-                                                  non_tensor_batch=non_tensor_batch_replay)
+                        batch, replay_buffer = DataProto.separate_by_index(batch, finished_index, selected_replay_index)
+                        gen_batch_output, gen_replay_buffer = DataProto.separate_by_index(gen_batch_output, finished_index, selected_replay_index)
 
                     batch = batch.union(gen_batch_output)
+
+                    if fuse_enable:
+                        # from replay_buffer get fused seqs
+                        _ = batch.pop(non_tensor_batch_keys=["output_fused", "seq_finished"]) # pop these elements in batch to avoid concat bugs
+                        if self.config.actor_rollout_ref.rollout.n > 1:
+                            batch_uids = []
+                            for i in range(len(batch)):
+                                uid = batch.non_tensor_batch['uid'][i]
+                                if not uid in batch_uids:
+                                    batch_uids.append(uid)
+                            finished_index = []
+                            unfinished_index = []
+                            for i in range(len(fuse_replay_buffer)):
+                                if fuse_replay_buffer.non_tensor_batch['uid'][i] in batch_uids:
+                                    finished_index.append(i)
+                                else:
+                                    unfinished_index.append(i)
+                            finished_batch, fuse_replay_buffer = DataProto.separate_by_index(fuse_replay_buffer, finished_index, unfinished_index)
+                            batch = DataProto.concat([batch, finished_batch]) 
+
+                        output_fused = gen_replay_buffer.non_tensor_batch.pop("output_fused")
+                        replay_index = []
+                        fused_index = []
+                        for index, fused in enumerate(output_fused.tolist()):
+                            if fused:
+                                fused_index.append(index)
+                            else:
+                                replay_index.append(index)
+                        fuse_buffer, replay_buffer = DataProto.separate_by_index(replay_buffer, fused_index, replay_index)
+                        _ = fuse_buffer.pop(non_tensor_batch_keys=["seq_finished"]) # pop this element in batch to avoid concat bugs
+                        
+                        fused_batch = self.actor_rollout_wg.generate_sequences_fused(fuse_buffer)
+                        
+                        overlapped_response_info = _compute_response_info(batch)
+                        overlapped_prompt_length = overlapped_response_info['prompt_length']
+                        overlapped_response_length = overlapped_response_info['response_length']
+                        if self.use_reference_policy:
+                            # compute reference log_prob
+                            with _timer('ref_overlap', timing_raw):
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
+                        if self.use_critic:
+                        with _timer('values_overlap', timing_raw):
+                            values = self.critic_wg.compute_values(batch)
+                            batch = batch.union(values)
+                            
+                        # TODO: check if n != 1, the group have unfinished responses
+                        seq_finished = gen_replay_buffer.non_tensor_batch.pop("seq_finished")
+                        if self.config.actor_rollout_ref.rollout.n > 1:
+                            uid_finished_dict = {}
+                            # update uid_finished_dict
+                            for i in range(len(fused_batch)):
+                                uid = fused_batch.non_tensor_batch['uid'][i]
+                                if uid in uid_finished_dict:
+                                    continue
+                                uid_finished_dict[uid] = True
+                                for j in range(len(replay_buffer)):
+                                    if (replay_buffer.non_tensor_batch['uid'][j] == uid) and not seq_finished[j]:
+                                        uid_finished_dict[uid] = False
+                                        break
+                            fuse_finished_index = []
+                            fuse_unfinished_index = []
+                            replay_finished_index = []
+                            replay_unfinished_index = []
+                            for i in range(len(fused_batch)):
+                                uid = fused_batch.non_tensor_batch['uid'][i]
+                                if uid_finished_dict[uid]:
+                                    fuse_finished_index.append(i)
+                                else:
+                                    fuse_unfinished_index.append(i)
+                            for i in range(len(replay_buffer)):
+                                uid = fused_batch.non_tensor_batch['uid'][i]
+                                if (uid in uid_finished_dict) and uid_finished_dict[uid]:
+                                    replay_finished_index.append(i)
+                                else:
+                                    replay_unfinished_index.append(i)
+                            fuse_finished, fuse_unfinished = DataProto.separate_by_index(fused_batch, fuse_finished_index, fuse_unfinished_index)
+                            fuse_replay_buffer = DataProto.concat([fuse_replay_buffer, fuse_unfinished])
+                            # set replay buffer
+                            replay_finished, replay_buffer = DataProto.separate_by_index(replay_buffer, replay_finished_index, replay_unfinished_index)
+                            gen_replay_finished, gen_replay_unfinished = DataProto.separate_by_index(gen_replay_buffer, replay_finished_index, replay_unfinished_index)
+                            fused_batch = DataProto.concat([fuse_finished, replay_finished.union(gen_replay_finished)]) 
+                            
+                        overlapped_batch = batch
+                        batch = fused_batch
                     
                     response_info = _compute_response_info(batch)
                     prompt_length = response_info['prompt_length']
                     response_length = response_info['response_length']
-                    result = self.actor_rollout_wg.count_flops_rollout(prompt_length, response_length, timing_raw['gen'])
-                    # print("resultlol",result)
-                    estimated_flops, promised_flops, tmp_ops = result[0]
-                    metrics.update({"mfu/rollout":estimated_flops / promised_flops / self.actor_rollout_wg.world_size})  
-                    total_ops += tmp_ops 
 
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
@@ -975,6 +1052,15 @@ class RayPPOTrainer(object):
                         metrics.update({"mfu/critic":estimated_flops / promised_flops / self.critic_wg.world_size})   
                         total_ops += tmp_ops 
                     
+                    if fuse_enable:
+                        batch = DataProto.concat([batch, overlapped_batch])
+                        prompt_length = torch.cat((prompt_length, overlapped_prompt_length), dim=0)
+                        response_length = torch.cat((response_length, overlapped_response_length), dim=0)
+                    result = self.actor_rollout_wg.count_flops_rollout(prompt_length, response_length, timing_raw['gen'])
+                    # print("resultlol",result)
+                    estimated_flops, promised_flops, tmp_ops = result[0]
+                    metrics.update({"mfu/rollout":estimated_flops / promised_flops / self.actor_rollout_wg.world_size})  
+                    total_ops += tmp_ops 
                 
                     with _timer('adv', timing_raw):
                         # compute scores. Support both model and function-based.

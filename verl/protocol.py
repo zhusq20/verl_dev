@@ -496,8 +496,8 @@ class DataProto:
         Returns:
             List[DataProto]: a list of DataProto after splitting
         """
-        assert len(
-            self) % chunks == 0, f'only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}.'
+        # assert len(
+        #     self) % chunks == 0, f'only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}.'
 
         if self.batch is not None:
             batch_lst = self.batch.chunk(chunks=chunks, dim=0)
@@ -596,6 +596,25 @@ class DataProto:
             meta_info=self.meta_info,
         )
 
+    @staticmethod
+    def separate_by_index(data: List['DataProto'], index1: List, index2: List) -> Tuple['DataProto', 'DataProto']:
+        batch_1 = {}
+        batch_2 = {}
+        for key, value in data.batch.items():
+            batch_1[key] = torch.index_select(value, dim=0, index=torch.IntTensor(index1))
+            batch_2[key] = torch.index_select(value, dim=0, index=torch.IntTensor(index2))
+        non_tensor_batch_1 = {}
+        non_tensor_batch_2 = {}
+        for key, value in data.non_tensor_batch.items():
+            non_tensor_batch_1[key] = value[index1]
+            non_tensor_batch_2[key] = value[index2]
+        batch1 = DataProto(batch=TensorDict(batch_1, batch_size=len(index1)),
+                                        non_tensor_batch=non_tensor_batch_1,
+                                        meta_info=data.meta_info)
+        batch2 = DataProto(batch=TensorDict(batch_2, batch_size=len(index2)),
+                                non_tensor_batch=non_tensor_batch_2,
+                                meta_info=data.meta_info)
+        return batch1, batch2
 
 import ray
 

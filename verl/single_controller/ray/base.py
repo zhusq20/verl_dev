@@ -315,6 +315,37 @@ class RayWorkerGroup(WorkerGroup):
             _rebind_actor_methods(new_worker_group, prefix)
             new_worker_group_dict[prefix] = new_worker_group
         return new_worker_group_dict
+    
+    def execute_rank_designated(self, method_name: str, *args, **kwargs):
+        return self.execute_rank_designated_async(method_name, *args, **kwargs)
+    
+    def execute_rank_designated_sync(self, method_name: str, *args, **kwargs):
+        return ray.get(self.execute_rank_designated_async(method_name, *args, **kwargs))
+    
+    def execute_rank_designated_async(self, method_name: str, *args, **kwargs):
+        ranks = []
+        if 'ranks' in kwargs:
+            ranks.extend(kwargs['ranks'])
+            del kwargs['ranks']
+        if len(ranks) == 0:
+            raise RuntimeError(
+                "When using \'execute_rank_part\' as excution method "
+                "\'ranks\' must be a valid parameter."
+            )
+        length = len(ranks)
+        # 这里我们假设，如果 args 和 kwargs 里面所有的参数都是 list，且所有的 list 长度都与 len(self._workers) 一致的话，我们会把
+        # list 中的每一个分别发到对应的 worker 上去
+        # print(f"execute_all_async: method {method_name}({args}, {kwargs})")
+        if all(isinstance(arg, list) for arg in args) and all(isinstance(kwarg, list) for kwarg in kwargs.values()):
+            if all(len(arg) == length for arg in args) and all(len(kwarg) == length for kwarg in kwargs.values()):
+                result = []
+                for i in ranks:
+                    sliced_args = tuple(arg[i] for arg in args)
+                    sliced_kwargs = {k: v[i] for k, v in kwargs.items()}
+                    remote_call = getattr(self._workers[i], method_name)
+                    result.append(remote_call.remote(*sliced_args, **sliced_kwargs))
+                return result
+        return [getattr(self._workers[rank], method_name).remote(*args, **kwargs) for rank in ranks]
 
     def execute_rank_zero_sync(self, method_name: str, *args, **kwargs):
         return ray.get(self.execute_rank_zero_async(method_name, *args, **kwargs))

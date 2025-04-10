@@ -145,6 +145,8 @@ class Scheduler(Scheduler):
         self.partial_rollout_enable = False
         self.partial: Deque[SequenceGroup] = deque()
         self.partial_rollout_blocks_to_swap_out: List[Tuple[int, int]] = []
+        # For overlapping rollout and inference
+        self.fused_request_ids = []
         
     def clear_partial_rollout_decoding_steps(self) -> None:
         self.sequence_group_rollout_steps = {}
@@ -216,6 +218,10 @@ class Scheduler(Scheduler):
     def transfer_partial_to_swapped(self) -> None:
         self.swapped.extend(self.partial)
         self.partial.clear()
+    
+    def transfer_partial_to_running(self) -> None:
+        self.running.extend(self.partial)
+        self.partial.clear()
 
     def sorted_partial_seq_groups(self) -> List[SequenceGroup]:
         # NOTE: this function will clear self.partial
@@ -233,3 +239,39 @@ class Scheduler(Scheduler):
         ret = self.partial_rollout_blocks_to_swap_out
         self.partial_rollout_blocks_to_swap_out = list()
         return ret
+    
+    def add_fused_request_id(self, request_id: str) -> None:
+        self.fused_request_ids.append(request_id)
+    
+    def transfer_fused_requests(self, request_id: Union[str, Iterable[str]]) -> None:
+        if isinstance(request_id, str):
+            request_id = (request_id, )
+        request_ids = set(request_id)
+        waiting_groups: List[SequenceGroup] = []
+        for state_queue in [self.waiting, self.running, self.swapped]:
+            temp_groups: List[SequenceGroup] = []
+            for seq_group in state_queue:
+                if not request_ids:
+                    # Using 'break' here may add two extra iterations,
+                    # but is acceptable to reduce complexity.
+                    break
+                if seq_group.request_id in request_ids:
+                    if not seq_group.is_finished():
+                        waiting_groups.append(seq_group)
+                        temp_groups.append(seq_group)
+                    request_ids.remove(seq_group.request_id)
+            for temp_group in temp_groups:
+                # Remove the sequence group from the state queue.
+                state_queue.remove(temp_group)
+        for i in range(len(waiting_groups)):
+            waiting_group = waiting_groups[i]
+            if self.partial_rollout_mode == "recompute":
+                self._free_seq_group_cross_attn_blocks(waiting_group)
+            # Remove the request.
+            for seq in waiting_group.get_seqs():
+                if seq.is_finished():
+                    continue
+                self.free_seq(seq)
+                
+    def is_request_fused(self, request_id: str) -> bool:
+        return (request_id in self.fused_request_ids)

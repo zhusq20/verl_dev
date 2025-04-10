@@ -30,11 +30,24 @@ def extract_solution(solution_str):
     final_solution = final_solution.split('#### ')[1].replace(',', '')
     return final_solution
 
+def make_prefix(dp, template_type):
+    # NOTE: also need to change reward_score/countdown.py
+    if template_type == 'base':
+        """This works for any base model"""
+        prefix = f"""A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.
+User: {dp} Show your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <answer>a+b</answer>.
+Assistant: Let me solve this step by step.
+<think>"""
+    elif template_type == 'qwen':
+        """This works for Qwen Instruct Models"""
+        prefix = f"""<|im_start|>system\nYou are a helpful assistant. You first thinks about the reasoning process in the mind and then provides the user with the answer.<|im_end|>\n<|im_start|>user\n {dp} Show your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <answer>a+b</answer>.<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>"""
+    return prefix
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--local_dir', default='~/data/gsm8k')
     parser.add_argument('--hdfs_dir', default=None)
+    parser.add_argument('--template_type', type=str, default='base')
 
     args = parser.parse_args()
 
@@ -53,7 +66,7 @@ if __name__ == '__main__':
         def process_fn(example, idx):
             question_raw = example.pop('question')
 
-            question = question_raw + ' ' + instruction_following
+            question = make_prefix(question_raw, template_type=args.template_type)
 
             answer_raw = example.pop('answer')
             solution = extract_solution(answer_raw)

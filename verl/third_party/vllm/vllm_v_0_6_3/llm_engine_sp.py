@@ -347,6 +347,8 @@ class LLMEngine(LLMEngine):
         self.partial_rollout_save_steps = partial_rollout_save_steps
         self.partial_rollout_mode = None
         self.partial_rollout_enable = False
+        # Overlapping
+        self.fuse_enable = False
 
     # TODO(sgm): add for verl but we may not tokenizer in Rollout
     def _init_tokenizer(self, tokenizer, **tokenizer_init_kwargs):
@@ -633,6 +635,16 @@ class LLMEngine(LLMEngine):
                 if self.scheduler[virtual_engine].get_rollout_steps(request_id) > self.partial_rollout_save_steps:
                     self.scheduler[virtual_engine].transfer_partial_rollout_requests(request_id)
         
+        if self.fuse_enable: 
+            max_num_batched_tokens = self.scheduler[virtual_engine].scheduler_config.max_num_batched_tokens
+            max_num_seqs = self.scheduler[virtual_engine].scheduler_config.max_num_seqs
+            if (scheduler_outputs.running_queue_size <= 0.6 * max_num_seqs and
+                scheduler_outputs.num_batched_tokens <= 0.6 * max_num_batched_tokens):
+                for seq_group_metadata in seq_group_metadata_list:
+                    request_id = seq_group_metadata.request_id
+                    self.scheduler[virtual_engine].add_fused_request_id(request_id)
+                    self.scheduler[virtual_engine].transfer_fused_requests(request_id)
+        
         if not self.has_unfinished_requests():
             # Drain async postprocessor (if exists)
             if len(ctx.output_queue) > 0:
@@ -659,6 +671,9 @@ class LLMEngine(LLMEngine):
     def transfer_partial_to_swapped(self, virtual_engine=0) -> None:
         self.scheduler[virtual_engine].transfer_partial_to_swapped()
         
+    def transfer_partial_to_running(self, virtual_engine=0) -> None:
+        self.scheduler[virtual_engine].transfer_partial_to_running()
+        
     def sorted_partial_seq_groups(self, virtual_engine=0) -> List[SequenceGroup]:
         return self.scheduler[virtual_engine].sorted_partial_seq_groups()
     
@@ -668,3 +683,12 @@ class LLMEngine(LLMEngine):
     def set_partial_rollout_mode(self, partial_rollout_mode: Optional[str], virtual_engine=0) -> None:
         self.partial_rollout_mode = partial_rollout_mode
         self.scheduler[virtual_engine].set_partial_rollout_mode(partial_rollout_mode)
+        
+    def set_fuse_enable(self, fuse_enable: bool) -> None:
+        self.fuse_enable = fuse_enable
+        
+    def is_request_fused(self, request_id: str, virtual_engine=0) -> bool:
+        return self.scheduler[virtual_engine].is_request_fused(request_id)
+    
+    def add_seq_group(self, seq_group, virtual_engine=0) -> None:
+        self.scheduler[virtual_engine].add_seq_group(seq_group)

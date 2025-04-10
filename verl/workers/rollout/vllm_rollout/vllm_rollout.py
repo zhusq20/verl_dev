@@ -154,14 +154,19 @@ class vLLMRollout(BaseRollout):
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
         # rebuild vllm cache engine
-        if self.config.free_cache_engine:
+        if self.config.free_cache_engine and not (partial_rollout_enable and self.partial_rollout_mode == 'reuse'):
             self.inference_engine.init_cache_engine()
 
         idx = prompts.batch['input_ids']  # (bs, prompt_length)
         # left-padded attention_mask
         attention_mask = prompts.batch['attention_mask']
         position_ids = prompts.batch['position_ids']
-        partial_rollout_enable = prompts.meta_info['partial_rollout_enable']
+        partial_rollout_enable = False
+        fuse_enable = False
+        if 'partial_rollout_enable' in prompts.meta_info:
+            partial_rollout_enable = prompts.meta_info['partial_rollout_enable']
+        if 'fuse_enable' in prompts.meta_info:
+            fuse_enable = prompts.meta_info['fuse_enable']
         # used to construct attention_mask
         eos_token_id = prompts.meta_info['eos_token_id']
 
@@ -186,6 +191,7 @@ class vLLMRollout(BaseRollout):
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             self.inference_engine.set_partial_rollout_enable(partial_rollout_enable)
+            self.inference_engine.set_fuse_enable(fuse_enable)
             output = self.inference_engine.generate(
                 prompts=None,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
@@ -197,6 +203,8 @@ class vLLMRollout(BaseRollout):
         response = output[0].to(idx.device)
         log_probs = output[1].to(idx.device)
         output_finished = output[2]
+        output_fused = output[3]
+        seq_finished = output[4]
 
         if response.shape[1] < self.config.response_length:
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
@@ -231,7 +239,7 @@ class vLLMRollout(BaseRollout):
         selected_replay_index = []
         finished_index = []
         for index, finished in enumerate(output_finished):
-            if finished:
+            if finished or output_fused[index]:
                 finished_index.append(index)
             else:
                 replay = True
@@ -261,13 +269,13 @@ class vLLMRollout(BaseRollout):
                 'attention_mask': attention_mask,
                 'position_ids': position_ids
             }
-        if partial_rollout_enable:
-            batch_size = len(finished_index)
-            batch_dict["prompts"] = torch.index_select(idx, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
-            batch_dict["responses"] = torch.index_select(response, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
-            batch_dict["input_ids"] = torch.index_select(seq, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
-            batch_dict["attention_mask"] = torch.index_select(attention_mask, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
-            batch_dict["position_ids"] = torch.index_select(position_ids, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
+        # if partial_rollout_enable:
+        #     batch_size = len(finished_index)
+        #     batch_dict["prompts"] = torch.index_select(idx, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
+        #     batch_dict["responses"] = torch.index_select(response, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
+        #     batch_dict["input_ids"] = torch.index_select(seq, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
+        #     batch_dict["attention_mask"] = torch.index_select(attention_mask, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
+        #     batch_dict["position_ids"] = torch.index_select(position_ids, dim=0, index=torch.IntTensor(finished_index).to(idx.device)).to(idx.device)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
         batch = TensorDict(
@@ -275,14 +283,136 @@ class vLLMRollout(BaseRollout):
             batch_size=batch_size)
 
         # free vllm cache engine
-        if self.config.free_cache_engine:
+        if self.config.free_cache_engine and not (partial_rollout_enable and self.partial_rollout_mode == 'reuse'):
             self.inference_engine.free_cache_engine()
 
-        if partial_rollout_enable:
-            output_proto = DataProto(batch=batch)
-            output_proto.meta_info = {
-                "output_finished": output_finished,
-            }
-            return output_proto
+        np_batch = {}
+
+        if partial_rollout_enable or fuse_enable:
+            np_batch.update({"output_finished": np.array(output_finished)})
+            # output_proto.meta_info = {
+            #     "output_finished": output_finished,
+            # }
+        if fuse_enable:
+            np_batch.update({"output_fused": np.array(output_fused)})
+            np_batch.update({"seq_finished": np.array(seq_finished)})
+
+        if len(np_batch) > 0:
+            output_proto = DataProto(batch=batch,
+                                     non_tensor_batch=np_batch)
         else:
-            return DataProto(batch=batch)
+            output_proto = DataProto(batch=batch)
+        
+        return output_proto
+    
+    def get_updated_sampling_params_fused(self, **kwargs):
+        # update sampling params
+        params = self.sampling_params.clone()
+        if kwargs:
+            for key, value in kwargs.items():
+                if hasattr(params, key):
+                    setattr(params, key, value)
+        return params
+
+    @torch.no_grad()
+    def generate_sequences_fused(self, prompts: DataProto, **kwargs) -> DataProto:
+        # rebuild vllm cache engine
+        self.inference_engine.init_cache_engine()
+        
+        idx = prompts.batch.pop('prompts')  # (bs, prompt_length)
+        # left-padded attention_mask
+        attention_mask = prompts.batch.pop('attention_mask')
+        position_ids = prompts.batch.pop('position_ids')
+        # used to construct attention_mask
+        eos_token_id = prompts.meta_info['eos_token_id']
+        partial_rollout_enable = False
+        fuse_enable = False
+        # fuse_info
+        _ = prompts.batch.pop('input_ids')
+        old_responses = prompts.batch.pop('responses').tolist()
+        # TODO: get old log_probs and cut it
+        
+        old_response_length = old_responses.shape[-1]
+        response_mask = attention_mask[:, -old_response_length:]
+        # reset mask and position_id
+        attention_mask = attention_mask[:, :-old_response_length]
+        position_ids = position_ids[:, :-old_response_length]
+        old_response_length = response_mask.sum(-1).float()  # (batch_size,)
+        
+        batch_size = idx.size(0)
+        for i in range(batch_size):
+            old_responses[i] = old_responses[i][:int(old_response_length[i].item())]
+
+        idx_list = []
+        # parse idx from torch.Tensor to List[List[str]]
+        for i in range(batch_size):
+            _prompt = _pre_process_inputs(self.pad_token_id, idx[i])
+            _prompt.extend(old_responses[i])
+            idx_list.append(_prompt)
+
+        self.inference_engine.set_partial_rollout_enable(partial_rollout_enable)
+        self.inference_engine.set_fuse_enable(fuse_enable)
+        output = self.inference_engine.generate(
+            prompts=None,  # because we have already convert it to prompt token id
+            sampling_params=[get_updated_sampling_params_fused(
+                max_tokens=self.sampling_params.max_tokens-int(response_length[i].item()),
+                n=1,
+                ) for i in range(batch_size)],
+            prompt_token_ids=idx_list,
+            use_tqdm=False)
+
+        # TODO(sgm): disable logprob when recompute_log_prob is enable
+        # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+        new_response = output[0].tolist()
+        output_finished = output[2]
+        output_fused = output[3]
+        
+        # concat old responses and new response
+        new_response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        new_response_length = new_response_attention_mask.sum(-1).float()  # (batch_size,)
+        
+        response = []
+        for i in range(batch_size):
+            response.append(old_responses[i].extend(new_response[i][:int(new_response_length[i].item())]))
+            
+        response = pad_sequence(response, batch_first=True, padding_value=self.pad_token_id)
+        response = response.to(idx.device)
+        
+        if response.shape[1] < self.config.response_length:
+            response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
+
+        seq = torch.cat([idx, response], dim=-1)
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+        
+        # TODO(sgm): fix position_ids on right_pad
+        # prompt: left pad + response: right pad
+        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+        response_position_ids = position_ids[:, -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+        
+        batch_dict = {
+                'prompts': idx,
+                'responses': response,
+                'input_ids': seq,  # here input_ids become the whole sentences
+                # 'old_log_probs': log_probs, # we will recompute old log prob with actor
+                'attention_mask': attention_mask,
+                'position_ids': position_ids
+            }
+        # all the tp ranks should contain the same data here. data in all ranks are valid
+        batch = TensorDict(
+            batch_dict,
+            batch_size=batch_size)
+        
+        # free vllm cache engine
+        if self.config.free_cache_engine and not (partial_rollout_enable and self.partial_rollout_mode == 'reuse'):
+            self.inference_engine.free_cache_engine()
+        
+        output_proto = DataProto(batch=batch)
+        output_proto = output_proto.union(prompts)
+        
+        return output_proto
