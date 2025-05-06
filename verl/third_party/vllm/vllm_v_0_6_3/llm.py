@@ -23,12 +23,12 @@ from verl.workers.rollout.tokenizer import HybridEngineBaseTokenizer
 from vllm import LLM
 from vllm.outputs import EmbeddingRequestOutput, RequestOutput
 from vllm.utils import Counter
-from vllm.inputs import PromptType
+from vllm.inputs import PromptType, TextPrompt, TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
 from vllm.usage.usage_lib import UsageContext
-from vllm.sequence import (Sequence, SequenceGroup)
+from vllm.sequence import SequenceGroup
 from vllm.model_executor.guided_decoding.guided_fields import (
     GuidedDecodingRequest, LLMGuidedOptions)
 
@@ -235,7 +235,7 @@ class LLM(LLM):
 
         for _, request_output in request_output_buffer.items():
             outputs.append(request_output)
-        self.llm_engine.clear_partial_rollout_decoding_steps()
+        self.llm_engine.clear_rollout_steps()
 
         if use_tqdm:
             pbar.close()
@@ -308,7 +308,7 @@ class LLM(LLM):
                     for logprobs_dict, id in zip(logprobs_dicts, output.token_ids):
                         logprob.append(logprobs_dict[id].logprob)
                     logprobs.append(torch.tensor(logprob))
-                output_fused.append(self.llm_engine.is_request_fused(output.request_id))
+                output_fused.append(self.llm_engine.is_request_fused(request_output.request_id))
                 seq_finished.append(output.finished())
 
         pad_token_id = (self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id is not None
@@ -321,6 +321,9 @@ class LLM(LLM):
 
     def sync_model_weights(self, actor_weights: Dict[str, torch.Tensor], load_format: str) -> None:
         self.llm_engine.sync_model_weights(actor_weights=actor_weights, load_format=load_format)
+        
+    def load_model_weights(self, load_format: str) -> None:
+        self.llm_engine.load_model_weights(load_format=load_format)
 
     def offload_model_weights(self) -> None:
         self.llm_engine.offload_model_weights()
@@ -387,54 +390,7 @@ class LLM(LLM):
 
     def set_fuse_enable(self, fuse_enable: bool) -> None:
         self.fuse_enable = fuse_enable
-        self.llm_engine.set_partial_rollout_enable(partial_rollout_enable)
-    
-    # fix bugs in vllm 0.6.3
-    def _validate_and_add_requests(
-        self,
-        prompts: Union[PromptType, Sequence[PromptType]],
-        params: Union[SamplingParams, Sequence[SamplingParams], PoolingParams,
-                      Sequence[PoolingParams]],
-        lora_request: Optional[Union[Sequence[LoRARequest], LoRARequest]],
-        prompt_adapter_request: Optional[PromptAdapterRequest],
-        guided_options: Optional[GuidedDecodingRequest] = None,
-        priority: Optional[List[int]] = None,
-    ) -> None:
-        if guided_options is not None:
-            warnings.warn(
-                "guided_options_request is deprecated, use "
-                "SamplingParams.guided_decoding instead",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
-        if isinstance(prompts, (str, dict)):
-            # Convert a single prompt to a list.
-            prompts = [prompts]
-
-        num_requests = len(prompts)
-        if isinstance(params, list) and len(params) != num_requests:
-            raise ValueError("The lengths of prompts and params "
-                             "must be the same.")
-        if isinstance(lora_request,
-                      list) and len(lora_request) != num_requests:
-            raise ValueError("The lengths of prompts and lora_request "
-                             "must be the same.")
-
-        for sp in params if isinstance(params, list) else (params, ):
-            if isinstance(sp, SamplingParams):
-                self._add_guided_params(sp, guided_options)
-
-                # We only care about the final output
-                sp.output_kind = RequestOutputKind.FINAL_ONLY
-
-        # Add requests to the engine.
-        for i, prompt in enumerate(prompts):
-            self._add_request(
-                prompt,
-                params[i] if isinstance(params, list) else params,
-                lora_request=lora_request[i] if isinstance(
-                    lora_request, Sequence) else lora_request,
-                prompt_adapter_request=prompt_adapter_request,
-                priority=priority[i] if priority else 0,
-            )
+        self.llm_engine.set_fuse_enable(fuse_enable)
+        
+    def set_max_response_len(self, max_response_len: int) -> None:
+        self.llm_engine.set_max_response_len(max_response_len)

@@ -148,7 +148,7 @@ class Scheduler(Scheduler):
         # For overlapping rollout and inference
         self.fused_request_ids = []
         
-    def clear_partial_rollout_decoding_steps(self) -> None:
+    def clear_rollout_steps(self) -> None:
         self.sequence_group_rollout_steps = {}
         
     def set_partial_rollout_enable(self, partial_rollout_enable) -> None:

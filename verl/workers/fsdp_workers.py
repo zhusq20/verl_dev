@@ -494,8 +494,8 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
     
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
-    def generate_sequences_fused(self, prompts: DataProto, ranks=None):
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def generate_sequences_offline(self, prompts: DataProto):
         prompts = prompts.to('cuda')
 
         assert self._is_rollout
@@ -518,7 +518,7 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences_fused(prompts=prompts)
+            output = self.rollout.generate_sequences(prompts=prompts)
 
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
@@ -532,6 +532,52 @@ class ActorRolloutRefWorker(Worker):
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
+        return output
+    
+    @register(dispatch_mode=Dispatch.TP_ONE_TO_ALL_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
+    def generate_sequences_fused(self, prompts: DataProto, ranks=None):
+        print("generate_sequences_fused begin")
+        prompts = prompts.to('cuda')
+
+        assert self._is_rollout
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+
+        
+        print("load_fsdp_param_and_grad end")
+        prompts.batch = prompts.batch.cuda()
+        meta_info = {
+            'eos_token_id':
+                self.generation_config.eos_token_id
+                if self.generation_config is not None else self.tokenizer.eos_token_id,
+            'pad_token_id':
+                self.generation_config.pad_token_id
+                if self.generation_config is not None else self.tokenizer.pad_token_id,
+        }
+        prompts.meta_info.update(meta_info)
+        print("rollout_sharding_manager begin")
+        
+        self.rollout_sharding_manager.reload()
+        print("rollout_sharding_manager end")
+        log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+
+        output = self.rollout.generate_sequences_fused(prompts=prompts)
+        log_gpu_memory_usage('After rollout generation', logger=logger)
+
+        # output = self.rollout_sharding_manager.postprocess_data(output)
+        self.rollout_sharding_manager.exit()
+
+        output = output.to('cpu')
+
+        if self._is_offload_param:
+            # NOTE(sgm): the grad is already in CPU, only offload param here
+            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+        # clear kv cache
+        torch.cuda.empty_cache()
+        log_gpu_memory_usage('After recompute log prob', logger=logger)
+        print("generate_sequences_fused end")
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -571,7 +617,7 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage('After compute_log_prob', logger=logger)
         return output
     
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
+    @register(dispatch_mode=Dispatch.TP_ONE_TO_ALL_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
     def compute_log_prob_fused(self, data: DataProto, ranks=None):
         assert self._is_actor
         if self._is_offload_param:
@@ -635,7 +681,7 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         return output
     
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
+    @register(dispatch_mode=Dispatch.TP_ONE_TO_ALL_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
     def compute_ref_log_prob_fused(self, data: DataProto, ranks=None):
         assert self._is_ref
 
@@ -709,6 +755,42 @@ class ActorRolloutRefWorker(Worker):
     def count_flops_rollout_logprob(self, prompt_length, response_length, delta_time):
         a,b,c= self.flops_counter.estimate_flops_rollout_logprob(prompt_length, response_length, delta_time)
         return a, b, c
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sync_rollout_model_weights(self, model_weights: dict):
+        # from torch.distributed.tensor import distribute_tensor, Shard, Replicate
+        # from collections import OrderedDict
+
+        # local_model_weights = OrderedDict()
+        # for k, v in model_weights.items():
+        #     local_v = distribute_tensor(v, self.device_mesh, [Replicate(), Shard(dim=0)])
+        #     local_model_weights[k] = local_v.to(torch.cuda.current_device())
+
+        self.rollout_sharding_manager.sync_rollout_model_weights(model_weights)
+        
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_actor_model_weights(self):
+        # only support actor
+        assert self._is_actor
+        import torch
+        from torch.distributed._tensor import DTensor
+        
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+
+        model_state_dict = self.actor_module_fsdp.state_dict()
+        for k, v in model_state_dict.items():
+            if isinstance(v, DTensor):
+                v = v.full_tensor()
+                model_state_dict[k] = v.cpu()
+
+        torch.distributed.barrier()
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+            
+        return model_state_dict
 
 class CriticWorker(Worker):
 
@@ -897,6 +979,31 @@ class CriticWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):
+        data = data.to('cuda')
+
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.critic_module,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+        micro_batch_size = self.config.forward_micro_batch_size_per_gpu
+        data.meta_info['micro_batch_size'] = micro_batch_size
+        data.meta_info['max_token_len'] = self.config.forward_max_token_len_per_gpu
+        data.meta_info['use_dynamic_bsz'] = self.config.use_dynamic_bsz
+        # perform forward computation
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            values = self.critic.compute_values(data=data)
+            output = DataProto.from_dict(tensors={'values': values})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+
+        output = output.to('cpu')
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
+        torch.cuda.empty_cache()
+        return output
+    
+    @register(dispatch_mode=Dispatch.TP_ONE_TO_ALL_DESIGNATED, execute_mode=Execute.RANK_DESIGNATED)
+    def compute_values_fused(self, data: DataProto, ranks=None):
         data = data.to('cuda')
 
         if self._is_offload_param:

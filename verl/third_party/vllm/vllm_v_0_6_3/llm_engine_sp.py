@@ -349,6 +349,7 @@ class LLMEngine(LLMEngine):
         self.partial_rollout_enable = False
         # Overlapping
         self.fuse_enable = False
+        self.max_response_len = 0
 
     # TODO(sgm): add for verl but we may not tokenizer in Rollout
     def _init_tokenizer(self, tokenizer, **tokenizer_init_kwargs):
@@ -423,6 +424,9 @@ class LLMEngine(LLMEngine):
     def sync_model_weights(self, actor_weights: Dict[str, torch.Tensor], load_format: str) -> None:
         self.model_executor.sync_model_weights(actor_weights=actor_weights, load_format=load_format)
 
+    def load_model_weights(self, load_format: str) -> None:
+        self.model_executor.load_model_weights(load_format=load_format)
+
     def offload_model_weights(self) -> None:
         self.model_executor.offload_model_weights()
         
@@ -430,8 +434,8 @@ class LLMEngine(LLMEngine):
         self.partial_rollout_enable = partial_rollout_enable
         self.scheduler[virtual_engine].set_partial_rollout_enable(partial_rollout_enable)
         
-    def clear_partial_rollout_decoding_steps(self, virtual_engine=0) -> None:
-        self.scheduler[virtual_engine].clear_partial_rollout_decoding_steps()
+    def clear_rollout_steps(self, virtual_engine=0) -> None:
+        self.scheduler[virtual_engine].clear_rollout_steps()
                     
     def step(self) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
         """Performs one decoding iteration and returns newly generated results.
@@ -537,7 +541,7 @@ class LLMEngine(LLMEngine):
         assert seq_group_metadata_list is not None
         assert scheduler_outputs is not None
         
-        if self.partial_rollout_enable:
+        if self.partial_rollout_enable or self.fuse_enable:
             for i in range(len(ctx.seq_group_metadata_list)):
                 ctx.seq_group_metadata_list[i].sampling_params.output_kind = RequestOutputKind.CUMULATIVE
 
@@ -628,20 +632,21 @@ class LLMEngine(LLMEngine):
             # Multi-step case
             return ctx.request_outputs
 
+        for seq_group_metadata in seq_group_metadata_list:
+            request_id = seq_group_metadata.request_id
+            self.scheduler[virtual_engine].add_rollout_steps(request_id)
+        
         if self.partial_rollout_enable:
             for seq_group_metadata in seq_group_metadata_list:
                 request_id = seq_group_metadata.request_id
-                self.scheduler[virtual_engine].add_rollout_steps(request_id)
                 if self.scheduler[virtual_engine].get_rollout_steps(request_id) > self.partial_rollout_save_steps:
                     self.scheduler[virtual_engine].transfer_partial_rollout_requests(request_id)
         
-        if self.fuse_enable: 
-            max_num_batched_tokens = self.scheduler[virtual_engine].scheduler_config.max_num_batched_tokens
-            max_num_seqs = self.scheduler[virtual_engine].scheduler_config.max_num_seqs
-            if (scheduler_outputs.running_queue_size <= 0.6 * max_num_seqs and
-                scheduler_outputs.num_batched_tokens <= 0.6 * max_num_batched_tokens):
-                for seq_group_metadata in seq_group_metadata_list:
-                    request_id = seq_group_metadata.request_id
+        if self.fuse_enable:
+            fuse_threshold = self.partial_rollout_save_steps - 100 if self.partial_rollout_save_steps else 0.6 * self.max_response_len
+            for seq_group_metadata in seq_group_metadata_list:
+                request_id = seq_group_metadata.request_id
+                if self.scheduler[virtual_engine].get_rollout_steps(request_id) > fuse_threshold:
                     self.scheduler[virtual_engine].add_fused_request_id(request_id)
                     self.scheduler[virtual_engine].transfer_fused_requests(request_id)
         
@@ -692,3 +697,6 @@ class LLMEngine(LLMEngine):
     
     def add_seq_group(self, seq_group, virtual_engine=0) -> None:
         self.scheduler[virtual_engine].add_seq_group(seq_group)
+
+    def set_max_response_len(self, max_response_len: int) -> None:
+        self.max_response_len = max_response_len

@@ -18,8 +18,11 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import sys
+import ray
 import uuid
 import time
+import asyncio
+from asyncio import Lock
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -27,12 +30,14 @@ from pprint import pprint
 from typing import Type, Dict
 from copy import deepcopy
 from tensordict import TensorDict
+from threading import Thread
+from collections import OrderedDict
 
 import numpy as np
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoFuture
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -355,10 +360,10 @@ class RayPPOTrainer(object):
         self.val_reward_fn = val_reward_fn
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert self.hybrid_engine, 'Currently, only support hybrid engine'
+        # assert self.hybrid_engine, 'Currently, only support hybrid engine'
 
-        if self.hybrid_engine:
-            assert Role.ActorRollout in role_worker_mapping, f'{role_worker_mapping.keys()=}'
+        # if self.hybrid_engine:
+        #     assert Role.ActorRollout in role_worker_mapping, f'{role_worker_mapping.keys()=}'
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
@@ -612,8 +617,8 @@ class RayPPOTrainer(object):
             }
 
             # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_wg.world_size)
+            test_output_gen_batch_padded = self.actor_wg.generate_sequences(test_gen_batch_padded)
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print('validation generation end')
@@ -660,15 +665,18 @@ class RayPPOTrainer(object):
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
-        # create actor and rollout
-        if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-            actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.ActorRollout],
-                                                     config=self.config.actor_rollout_ref,
-                                                     role='actor_rollout')
-            self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
-        else:
-            raise NotImplementedError
+        # create actor
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
+        actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Actor],
+                                                 config=self.config.actor_rollout_ref,
+                                                 role='actor_rollout')
+        self.resource_pool_to_cls[resource_pool]['actor'] = actor_rollout_cls
+        # create rollout
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
+        actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Rollout],
+                                                 config=self.config.actor_rollout_ref,
+                                                 role='actor_rollout')
+        self.resource_pool_to_cls[resource_pool]['rollout'] = actor_rollout_cls
 
         # create critic
         if self.use_critic:
@@ -698,9 +706,15 @@ class RayPPOTrainer(object):
         all_wg = {}
         self.wg_dicts = []
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
-            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            if len(class_dict) > 1:
+                worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+                wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
+                spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            else:
+                wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=list(class_dict.values())[0])
+                spawn_wg = {
+                    list(class_dict.keys())[0]: wg_dict,
+                }
             all_wg.update(spawn_wg)
             # keep the referece of WorkerDict to support ray >= 2.31. Ref: https://github.com/ray-project/ray/pull/45699
             self.wg_dicts.append(wg_dict)
@@ -718,8 +732,11 @@ class RayPPOTrainer(object):
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg['actor_rollout']
-        self.actor_rollout_wg.init_model()
+        self.actor_wg = all_wg['actor']
+        self.actor_wg.init_model()
+        
+        self.rollout_wg = all_wg['rollout']
+        self.rollout_wg.init_model()
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -729,7 +746,7 @@ class RayPPOTrainer(object):
 
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
             self.config.trainer.default_hdfs_dir, f'global_step_{self.global_steps}', 'actor')
-        self.actor_rollout_wg.save_checkpoint(actor_local_path,
+        self.actor_wg.save_checkpoint(actor_local_path,
                                               actor_remote_path,
                                               self.global_steps,
                                               remove_previous_ckpt=self.config.trainer.remove_previous_ckpt_in_save)
@@ -791,8 +808,10 @@ class RayPPOTrainer(object):
         actor_path = os.path.join(global_step_folder, 'actor')
         critic_path = os.path.join(global_step_folder, 'critic')
         # load actor
-        self.actor_rollout_wg.load_checkpoint(actor_path,
-                                              del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+        self.rollout_wg.load_checkpoint(actor_path,
+                                      del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+        self.actor_wg.load_checkpoint(actor_path,
+                                      del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(critic_path,
@@ -810,7 +829,7 @@ class RayPPOTrainer(object):
         attention_mask = batch.batch['attention_mask']
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch['attention_mask'].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
-        world_size = self.actor_rollout_wg.world_size
+        world_size = self.rollout_wg.world_size
         global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst,
                                                               k_partitions=world_size,
                                                               equal_size=True)
@@ -822,6 +841,179 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    async def gen_and_store_rollout(self, batch: DataProto, future: DataProtoFuture,
+                                    timing_raw, partial_rollout_enable, metrics):
+        print(f"Gen !")
+        with _timer('gen', timing_raw):
+            still_running = future.futures
+            while len(still_running) > 0:
+                finished, still_running = ray.wait(still_running)
+        gen_batch_output = future.get()
+
+        batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                                    dtype=object)
+
+        if self.config.algorithm.adv_estimator == 'remax':
+            with _timer('gen_max', timing_raw):
+                gen_baseline_batch = deepcopy(gen_batch_output)
+                gen_baseline_batch.meta_info['do_sample'] = False
+                gen_baseline_output = self.rollout_wg.generate_sequences(gen_baseline_batch)
+
+            batch = batch.union(gen_baseline_output)
+            reward_baseline_tensor = self.reward_fn(batch)
+            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+
+            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+
+            batch.batch['reward_baselines'] = reward_baseline_tensor
+
+            del gen_baseline_batch, gen_baseline_output
+
+        # repeat to align with repeated responses in rollout
+        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    
+        # save the unfinished seq_group to replay buffer
+        if partial_rollout_enable:
+            output_finished = gen_batch_output.non_tensor_batch.pop("output_finished")
+            if len(self.replay_buffer) > 0:
+                batch = DataProto.concat([self.replay_buffer, batch])
+                self.replay_buffer = DataProto()
+            selected_replay_index = []
+            finished_index = []
+            for index, finished in enumerate(output_finished.tolist()):
+                if finished:
+                    finished_index.append(index)
+                else:
+                    selected_replay_index.append(index)
+            batch, self.replay_buffer = DataProto.separate_by_index(batch, finished_index, selected_replay_index)
+            gen_batch_output, gen_replay_buffer = DataProto.separate_by_index(gen_batch_output, finished_index, selected_replay_index)
+
+        batch = batch.union(gen_batch_output)
+
+        # balance the number of valid tokens on each dp rank.
+        # Note that this breaks the order of data inside the batch.
+        # Please take care when you implement group based adv computation such as GRPO and rloo
+        self._balance_batch(batch, metrics=metrics)
+
+        # compute global_valid tokens
+        batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+        
+        # async with self.lock:
+        if len(self.store_buffer) > 0:
+            self.store_buffer = DataProto.concat([store_buffer, batch])
+        else:
+            self.store_buffer = deepcopy(batch)
+        
+        print(f"Gen store_buffer length: {len(self.store_buffer)}")
+        return
+            
+    async def update(self, timing_raw, total_ops, metrics) -> DataProto:
+        train_batch_size = self.config.data.train_batch_size
+        while len(self.store_buffer) < train_batch_size:
+            continue
+        # async with self.lock:
+        # TODO: select rollouts to update actor
+        select_index = [i for i in range(train_batch_size)]
+        replay_index = [i for i in range(train_batch_size, len(self.store_buffer))]
+        batch, self.store_buffer = DataProto.separate_by_index(self.store_buffer, select_index, replay_index)
+        
+        response_info = _compute_response_info(batch)
+        prompt_length = response_info['prompt_length']
+        response_length = response_info['response_length']
+        
+        # recompute old_log_probs
+        with _timer('old_log_prob', timing_raw):
+            old_log_prob = self.actor_wg.compute_log_prob(batch)
+            batch = batch.union(old_log_prob)
+        # '''这里flops怎么算?'''
+        # step_flops, _ = self.actor_rollout_wg.count_flops_rollout(prompt_length, response_length, timing_raw['old_log_prob']) 
+        # estimated_flops, promised_flops, tmp_ops = self.actor_wg.count_flops_rollout_logprob(prompt_length, response_length, timing_raw['old_log_prob'])[0]
+        # metrics.update({"mfu/rollout_logp":estimated_flops / promised_flops / self.actor_wg.world_size})   
+        # total_ops += tmp_ops
+        
+        if self.use_reference_policy:
+            # compute reference log_prob
+            with _timer('ref', timing_raw):
+                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                batch = batch.union(ref_log_prob)
+        # step_flops += self.ref_policy_wg.count_flops_ref(prompt_length, response_length, timing_raw['ref'])
+        # estimated_flops, promised_flops, tmp_ops = self.ref_policy_wg.count_flops_ref(prompt_length, response_length, timing_raw['ref'])[0]
+        # metrics.update({"mfu/ref":estimated_flops / promised_flops / self.ref_policy_wg.world_size})   
+        # total_ops += tmp_ops
+        
+        # compute values
+        if self.use_critic:
+            with _timer('values', timing_raw):
+                values = self.critic_wg.compute_values(batch)
+                batch = batch.union(values)
+            # step_flops += self.critic_wg.count_flops_critic(prompt_length, response_length, timing_raw['values'])
+            # estimated_flops, promised_flops, tmp_ops = self.critic_wg.count_flops_ref(prompt_length, response_length, timing_raw['critic'])[0]
+            # metrics.update({"mfu/critic":estimated_flops / promised_flops / self.critic_wg.world_size})   
+            # total_ops += tmp_ops 
+        
+        # result = self.actor_wg.count_flops_rollout(prompt_length, response_length, timing_raw['gen'])
+        # print("resultlol",result)
+        # estimated_flops, promised_flops, tmp_ops = result[0]
+        # metrics.update({"mfu/rollout":estimated_flops / promised_flops / self.actor_wg.world_size})  
+        # total_ops += tmp_ops 
+        
+        with _timer('adv', timing_raw):
+            # compute scores. Support both model and function-based.
+            # We first compute the scores using reward model. Then, we call reward_fn to combine
+            # the results from reward model and rule-based results.
+            if self.use_rm:
+                # we first compute reward model score
+                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                batch = batch.union(reward_tensor)
+
+            # we combine with rule-based rm
+            reward_tensor = self.reward_fn(batch)
+            batch.batch['token_level_scores'] = reward_tensor
+
+            # compute rewards. apply_kl_penalty if available
+            if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                batch, kl_metrics = apply_kl_penalty(batch,
+                                                     kl_ctrl=self.kl_ctrl,
+                                                     kl_penalty=self.config.algorithm.kl_penalty)
+                metrics.update(kl_metrics)
+            else:
+                batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+
+            # compute advantages, executed on the driver process
+            batch = compute_advantage(batch,
+                                      adv_estimator=self.config.algorithm.adv_estimator,
+                                      gamma=self.config.algorithm.gamma,
+                                      lam=self.config.algorithm.lam,
+                                      num_repeat=self.config.actor_rollout_ref.rollout.n)
+            
+        # step_flops += self.rm_wg.count_flops_rm(prompt_length, response_length, timing_raw['adv'])
+        # if self.use_rm:
+        #     estimated_flops, promised_flops, tmp_ops = self.rm_wg.count_flops_ref(prompt_length, response_length, timing_raw['adv'])[0]
+            # metrics.update({"mfu/reward":estimated_flops / promised_flops / self.rm_wg.world_size})   
+            # total_ops += tmp_ops 
+
+        # update critic
+        if self.use_critic:
+            with _timer('update_critic', timing_raw):
+                critic_output = self.critic_wg.update_critic(batch)
+            critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+            metrics.update(critic_output_metrics)
+            
+            # total_ops += metrics['mfu/critic'] / self.critic_wg.config.ppo_epochs * promised_flops * self.critic_wg.world_size
+
+        # implement critic warmup
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            # update actor
+            with _timer('update_actor', timing_raw):
+                actor_output = self.actor_wg.update_actor(batch)
+            actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+            metrics.update(actor_output_metrics)
+        return batch
+    
+    def start_thread_loop(self, loop):
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+        
     def fit(self):
         """
         The training loop of PPO.
@@ -843,264 +1035,77 @@ class RayPPOTrainer(object):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
-            val_metrics = self._validate()
-            pprint(f'Initial validation metrics: {val_metrics}')
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get('val_only', False):
-                return
+        # if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+        #     val_metrics = self._validate()
+        #     pprint(f'Initial validation metrics: {val_metrics}')
+        #     logger.log(data=val_metrics, step=self.global_steps)
+        #     if self.config.trainer.get('val_only', False):
+        #         return
 
         # we start from step 1
         self.global_steps += 1
         
-        replay_buffer: DataProto = DataProto()
-        fuse_replay_buffer: DataProto = DataProto()
-        fuse_buffer: DataProto = DataProto()
-        overlapped_batch: DataProto = DataProto()
+        self.replay_buffer: DataProto = DataProto()
+        self.store_buffer: DataProto = DataProto()
+        
+        batch_list: list = []
+        gen_obj_ref_list: list = []
+        metrics_list: list = []
+        timing_raw_list: list = []
 
         begin_timestamp = time.time()
-        for epoch in range(self.config.trainer.total_epochs):
+        while True:
+            # FIXME: add param k to config
+            # k = int(len(metrics_list) // 2)
+            k = 1
+            
+            cnt = 0
             for batch_dict in self.train_dataloader:
-                metrics = {}
-                timing_raw = {}
-                total_ops = 0
-                tmp_ops = 0
-
+                cnt += 1
+                if cnt > k * 2:
+                    break
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-
-                print(f'Step: {self.global_steps}')
 
                 # pop those keys for generation
                 partial_rollout_enable = False
                 if self.config.actor_rollout_ref.rollout.partial_rollout_save_steps:
                     partial_rollout_enable = True
-                fuse_enable = self.config.trainer.fuse_enable
                 
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
                 gen_batch.meta_info.update({
                     'partial_rollout_enable': partial_rollout_enable,
-                    'fuse_enable': fuse_enable,
                 })
-
-                with _timer('step', timing_raw):
-                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                             dtype=object)
                     
-                    # generate a batch
-                    with _timer('gen', timing_raw):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                # generate a batch
+                batch_list.append(batch)
+                gen_obj_ref_list.append(self.rollout_wg.generate_sequences_offline(gen_batch))
+                metrics_list.append({})
+                timing_raw_list.append({})
+            
+            new_loop = asyncio.new_event_loop()
+            t = Thread(target=self.start_thread_loop, args=(new_loop,))
+            t.start()
 
-                    if self.config.algorithm.adv_estimator == 'remax':
-                        with _timer('gen_max', timing_raw):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info['do_sample'] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+            # self.lock = Lock()
+            for index in range(len(gen_obj_ref_list)):
+                asyncio.run_coroutine_threadsafe(self.gen_and_store_rollout(batch_list[index], gen_obj_ref_list[index], 
+                                                                            timing_raw_list[index], partial_rollout_enable, 
+                                                                            metrics_list[index]), new_loop)
+            
+            for index in range(k):
+                metrics = metrics_list[index]
+                timing_raw = timing_raw_list[index]
+                total_ops = 0
 
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                with _timer('step_update', timing_raw):
+                    print(f'Step: {self.global_steps}')
 
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-
-                            batch.batch['reward_baselines'] = reward_baseline_tensor
-
-                            del gen_baseline_batch, gen_baseline_output
-
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    
-                    # save the unfinished seq_group to replay buffer
-                    if partial_rollout_enable or fuse_enable:
-                        output_finished = gen_batch_output.non_tensor_batch.pop("output_finished")
-                        if len(replay_buffer) > 0:
-                            batch = DataProto.concat([replay_buffer, batch])
-                            replay_buffer = DataProto()
-                        selected_replay_index = []
-                        finished_index = []
-                        for index, finished in enumerate(output_finished.tolist()):
-                            if finished:
-                                finished_index.append(index)
-                            else:
-                                selected_replay_index.append(index)
-                        batch, replay_buffer = DataProto.separate_by_index(batch, finished_index, selected_replay_index)
-                        gen_batch_output, gen_replay_buffer = DataProto.separate_by_index(gen_batch_output, finished_index, selected_replay_index)
-
-                    batch = batch.union(gen_batch_output)
-
-                    if fuse_enable:
-                        # from replay_buffer get fused seqs
-                        _ = batch.non_tensor_batch.pop("output_fused") # pop these elements in batch to avoid concat bugs
-                        _ = batch.non_tensor_batch.pop("seq_finished") # pop these elements in batch to avoid concat bugs
-                        if self.config.actor_rollout_ref.rollout.n > 1:
-                            batch_uids = []
-                            for i in range(len(batch)):
-                                uid = batch.non_tensor_batch['uid'][i]
-                                if not uid in batch_uids:
-                                    batch_uids.append(uid)
-                            finished_index = []
-                            unfinished_index = []
-                            for i in range(len(fuse_replay_buffer)):
-                                if fuse_replay_buffer.non_tensor_batch['uid'][i] in batch_uids:
-                                    finished_index.append(i)
-                                else:
-                                    unfinished_index.append(i)
-                            finished_batch, fuse_replay_buffer = DataProto.separate_by_index(fuse_replay_buffer, finished_index, unfinished_index)
-                            batch = DataProto.concat([batch, finished_batch]) 
-
-                        output_fused = gen_replay_buffer.non_tensor_batch.pop("output_fused")
-                        replay_index = []
-                        fused_index = []
-                        for index, fused in enumerate(output_fused.tolist()):
-                            if fused:
-                                fused_index.append(index)
-                            else:
-                                replay_index.append(index)
-                        fuse_buffer, replay_buffer = DataProto.separate_by_index(replay_buffer, fused_index, replay_index)
-                        gen_fuse_buffer, _ = DataProto.separate_by_index(gen_replay_buffer, fused_index, replay_index)
-                        _ = gen_fuse_buffer.non_tensor_batch.pop("seq_finished") # pop this element in batch to avoid concat bugs
-                        fuse_buffer = fuse_buffer.union(gen_fuse_buffer)
-                        
-                        rollout_tp_size = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
-                        gen_ranks = [i for i in range(rollout_tp_size)]
-                        with _timer('gen_overlap', timing_raw):
-                            fused_batch = self.actor_rollout_wg.generate_sequences_fused(prompts=fuse_buffer, ranks=gen_ranks)
-                        
-                        overlapped_response_info = _compute_response_info(batch)
-                        overlapped_prompt_length = overlapped_response_info['prompt_length']
-                        overlapped_response_length = overlapped_response_info['response_length']
-                        
-                        total_size = self.config.trainer.n_gpus_per_node
-                        inference_ranks = [i for i in range(rollout_tp_size, total_size)]
-                        if self.use_reference_policy and len(inference_ranks) > 0:
-                            # compute reference log_prob
-                            with _timer('ref_overlap', timing_raw):
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob_fused(data=batch, ranks=inference_ranks)
-                                batch = batch.union(ref_log_prob)
-                        if self.use_critic and len(inference_ranks) > 0:
-                            with _timer('values_overlap', timing_raw):
-                                values = self.critic_wg.compute_values_fused(data=batch, ranks=inference_ranks)
-                                batch = batch.union(values)
-                            
-                        # TODO: check if n != 1, the group have unfinished responses
-                        seq_finished = gen_replay_buffer.non_tensor_batch.pop("seq_finished")
-                        if self.config.actor_rollout_ref.rollout.n > 1:
-                            uid_finished_dict = {}
-                            # update uid_finished_dict
-                            for i in range(len(fused_batch)):
-                                uid = fused_batch.non_tensor_batch['uid'][i]
-                                if uid in uid_finished_dict:
-                                    continue
-                                uid_finished_dict[uid] = True
-                                for j in range(len(replay_buffer)):
-                                    if (replay_buffer.non_tensor_batch['uid'][j] == uid) and not seq_finished[j]:
-                                        uid_finished_dict[uid] = False
-                                        break
-                            fuse_finished_index = []
-                            fuse_unfinished_index = []
-                            replay_finished_index = []
-                            replay_unfinished_index = []
-                            for i in range(len(fused_batch)):
-                                uid = fused_batch.non_tensor_batch['uid'][i]
-                                if uid_finished_dict[uid]:
-                                    fuse_finished_index.append(i)
-                                else:
-                                    fuse_unfinished_index.append(i)
-                            for i in range(len(replay_buffer)):
-                                uid = fused_batch.non_tensor_batch['uid'][i]
-                                if (uid in uid_finished_dict) and uid_finished_dict[uid]:
-                                    replay_finished_index.append(i)
-                                else:
-                                    replay_unfinished_index.append(i)
-                            fuse_finished, fuse_unfinished = DataProto.separate_by_index(fused_batch, fuse_finished_index, fuse_unfinished_index)
-                            fuse_replay_buffer = DataProto.concat([fuse_replay_buffer, fuse_unfinished])
-                            # set replay buffer
-                            replay_finished, replay_buffer = DataProto.separate_by_index(replay_buffer, replay_finished_index, replay_unfinished_index)
-                            gen_replay_finished, gen_replay_unfinished = DataProto.separate_by_index(gen_replay_buffer, replay_finished_index, replay_unfinished_index)
-                            fused_batch = DataProto.concat([fuse_finished, replay_finished.union(gen_replay_finished)]) 
-                            
-                        overlapped_batch = batch
-                        batch = fused_batch
-                    
-                    response_info = _compute_response_info(batch)
-                    prompt_length = response_info['prompt_length']
-                    response_length = response_info['response_length']
-
-                    # balance the number of valid tokens on each dp rank.
-                    # Note that this breaks the order of data inside the batch.
-                    # Please take care when you implement group based adv computation such as GRPO and rloo
-                    self._balance_batch(batch, metrics=metrics)
-
-                    # compute global_valid tokens
-                    batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
-
-                    # recompute old_log_probs
-                    with _timer('old_log_prob', timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        batch = batch.union(old_log_prob)
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with _timer('ref', timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
-
-                    # compute values
-                    if self.use_critic:
-                        with _timer('values', timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
-                    
-                    if fuse_enable:
-                        batch = DataProto.concat([batch, overlapped_batch])
-                        prompt_length = torch.cat((prompt_length, overlapped_prompt_length), dim=0)
-                        response_length = torch.cat((response_length, overlapped_response_length), dim=0)
-                    result = self.actor_rollout_wg.count_flops_rollout(prompt_length, response_length, timing_raw['gen'])
-                
-                    with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        if self.use_rm:
-                            # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
-                        # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
-
-                        # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
-
-                        # compute advantages, executed on the driver process
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
-
-                    # update critic
-                    if self.use_critic:
-                        with _timer('update_critic', timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
-                        metrics.update(critic_output_metrics)
-                        
-
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with _timer('update_actor', timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                        metrics.update(actor_output_metrics)
-                        
-                    # can't directly obtain self.actor_rollout_wg.config
+                    loop = asyncio.new_event_loop()
+                    task = loop.create_task(self.update(timing_raw, total_ops, metrics))
+                    loop.run_until_complete(task)
+                    batch = task.result()
+                    loop.close()
+                    # batch = self.update(timing_raw, total_ops, metrics)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
@@ -1113,27 +1118,48 @@ class RayPPOTrainer(object):
                             self.global_steps % self.config.trainer.save_freq == 0:
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
-
+                            
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 metrics['total_ops'] = total_ops
 
-                #假设每个模型都占满所有gpu
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
-
+                
                 self.global_steps += 1
 
                 if self.global_steps >= self.total_training_steps:
                     print(f"TOTAL TIME: {time.time()-begin_timestamp:.4f} s")
                     return
-                    # perform validation after training
-                    if self.val_reward_fn is not None:
-                        val_metrics = self._validate()
-                        pprint(f'Final validation metrics: {val_metrics}')
-                        logger.log(data=val_metrics, step=self.global_steps)
-                    if self.config.trainer.save_freq > 0 and \
-                            (self.global_steps - 1) % self.config.trainer.save_freq != 0:
-                        with _timer('save_checkpoint', timing_raw):
-                            self._save_checkpoint()
+                #     # perform validation after training
+                #     if self.val_reward_fn is not None:
+                #         val_metrics = self._validate()
+                #         pprint(f'Final validation metrics: {val_metrics}')
+                #         logger.log(data=val_metrics, step=self.global_steps)
+                #     if self.config.trainer.save_freq > 0 and \
+                #             (self.global_steps - 1) % self.config.trainer.save_freq != 0:
+                #         with _timer('save_checkpoint', timing_raw):
+                #             self._save_checkpoint()
+                #     return
+            
+            new_loop.stop()
+            # cancel uncompleted generation tasks
+            print(f"Ray cancel {len(gen_obj_ref_list)} tasks")
+            for index in range(len(gen_obj_ref_list)):
+                finished, still_running = ray.wait(gen_obj_ref_list[index].futures)
+                if len(still_running) > 0:
+                    for obj_ref in still_running:
+                        ray.cancel(obj_ref, recursive=True)
+            # sync model weights
+            print("Get model weights")
+            model_weights = self.actor_wg.get_actor_model_weights()[0]
+            print("Sync model weights")
+            self.rollout_wg.sync_rollout_model_weights(model_weights)
+            
+            batch_list.clear()
+            gen_obj_ref_list.clear()
+            metrics_list.clear()
+            timing_raw_list.clear()
+
+        print(f"TOTAL TIME: {time.time()-begin_timestamp:.4f} s")

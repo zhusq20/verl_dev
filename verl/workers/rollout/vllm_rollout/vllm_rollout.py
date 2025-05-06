@@ -33,6 +33,7 @@ import torch.distributed
 from tensordict import TensorDict
 from torch import nn
 
+from torch.nn.utils.rnn import pad_sequence
 from verl import DataProto
 from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
 from verl.workers.rollout.base import BaseRollout
@@ -134,6 +135,7 @@ class vLLMRollout(BaseRollout):
         
         # Partial rollout
         self.replay_buffer = DataProto()
+        self.inference_engine.set_max_response_len(config.response_length)
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -153,6 +155,13 @@ class vLLMRollout(BaseRollout):
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        partial_rollout_enable = False
+        fuse_enable = False
+        if 'partial_rollout_enable' in prompts.meta_info:
+            partial_rollout_enable = prompts.meta_info['partial_rollout_enable']
+        if 'fuse_enable' in prompts.meta_info:
+            fuse_enable = prompts.meta_info['fuse_enable']
+
         # rebuild vllm cache engine
         if self.config.free_cache_engine and not (partial_rollout_enable and self.partial_rollout_mode == 'reuse'):
             self.inference_engine.init_cache_engine()
@@ -161,12 +170,6 @@ class vLLMRollout(BaseRollout):
         # left-padded attention_mask
         attention_mask = prompts.batch['attention_mask']
         position_ids = prompts.batch['position_ids']
-        partial_rollout_enable = False
-        fuse_enable = False
-        if 'partial_rollout_enable' in prompts.meta_info:
-            partial_rollout_enable = prompts.meta_info['partial_rollout_enable']
-        if 'fuse_enable' in prompts.meta_info:
-            fuse_enable = prompts.meta_info['fuse_enable']
         # used to construct attention_mask
         eos_token_id = prompts.meta_info['eos_token_id']
 
@@ -289,13 +292,13 @@ class vLLMRollout(BaseRollout):
         np_batch = {}
 
         if partial_rollout_enable or fuse_enable:
-            np_batch.update({"output_finished": np.array(output_finished)})
+            np_batch.update({"output_finished": np.array(output_finished, dtype=object)})
             # output_proto.meta_info = {
             #     "output_finished": output_finished,
             # }
         if fuse_enable:
-            np_batch.update({"output_fused": np.array(output_fused)})
-            np_batch.update({"seq_finished": np.array(seq_finished)})
+            np_batch.update({"output_fused": np.array(output_fused, dtype=object)})
+            np_batch.update({"seq_finished": np.array(seq_finished, dtype=object)})
 
         if len(np_batch) > 0:
             output_proto = DataProto(batch=batch,
@@ -329,7 +332,7 @@ class vLLMRollout(BaseRollout):
         fuse_enable = False
         # fuse_info
         _ = prompts.batch.pop('input_ids')
-        old_responses = prompts.batch.pop('responses').tolist()
+        old_responses = prompts.batch.pop('responses')
         # TODO: get old log_probs and cut it
         
         old_response_length = old_responses.shape[-1]
@@ -340,6 +343,7 @@ class vLLMRollout(BaseRollout):
         old_response_length = response_mask.sum(-1).float()  # (batch_size,)
         
         batch_size = idx.size(0)
+        old_responses = old_responses.tolist()
         for i in range(batch_size):
             old_responses[i] = old_responses[i][:int(old_response_length[i].item())]
 
@@ -354,8 +358,8 @@ class vLLMRollout(BaseRollout):
         self.inference_engine.set_fuse_enable(fuse_enable)
         output = self.inference_engine.generate(
             prompts=None,  # because we have already convert it to prompt token id
-            sampling_params=[get_updated_sampling_params_fused(
-                max_tokens=self.sampling_params.max_tokens-int(response_length[i].item()),
+            sampling_params=[self.get_updated_sampling_params_fused(
+                max_tokens=self.sampling_params.max_tokens-int(old_response_length[i].item()),
                 n=1,
                 ) for i in range(batch_size)],
             prompt_token_ids=idx_list,
@@ -363,17 +367,19 @@ class vLLMRollout(BaseRollout):
 
         # TODO(sgm): disable logprob when recompute_log_prob is enable
         # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-        new_response = output[0].tolist()
+        new_response = output[0]
         output_finished = output[2]
         output_fused = output[3]
         
         # concat old responses and new response
-        new_response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        new_response_attention_mask = get_eos_mask(response_id=new_response, eos_token=eos_token_id, dtype=attention_mask.dtype)
         new_response_length = new_response_attention_mask.sum(-1).float()  # (batch_size,)
         
+        new_response = new_response.tolist()
         response = []
         for i in range(batch_size):
-            response.append(old_responses[i].extend(new_response[i][:int(new_response_length[i].item())]))
+            response.append(
+                torch.cat([torch.Tensor(old_responses[i]), torch.Tensor(new_response[i][:int(new_response_length[i].item())])], dim=0))
             
         response = pad_sequence(response, batch_first=True, padding_value=self.pad_token_id)
         response = response.to(idx.device)

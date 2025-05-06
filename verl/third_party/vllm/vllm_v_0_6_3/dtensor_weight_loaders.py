@@ -15,6 +15,7 @@
 
 from typing import Dict
 
+import torch
 import torch.nn as nn
 from torch.distributed._tensor import DTensor
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -309,17 +310,32 @@ def gpt2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn
     pass
 
 
-def redistribute_dtensor(param_name: str, loaded_weights: DTensor, parallelize_plan: Dict = None):
-    param_name = _process_parameter_names(name=param_name)
-    if parallelize_plan is not None:
-        assert (
-            param_name
-            in parallelize_plan.keys()), f"param name: {param_name} not in parallelize_plan :{parallelize_plan.keys()}"
-        placement = parallelize_plan[param_name]
-        local_loaded_weights = loaded_weights.redistribute(device_mesh=loaded_weights.device_mesh,
-                                                           placements=placement).to_local()
+def redistribute_dtensor(param_name: str, loaded_weights, parallelize_plan: Dict = None):
+    if isinstance(loaded_weights, DTensor):
+        param_name = _process_parameter_names(name=param_name)
+        if parallelize_plan is not None:
+            assert (
+                param_name
+                in parallelize_plan.keys()), f"param name: {param_name} not in parallelize_plan :{parallelize_plan.keys()}"
+            placement = parallelize_plan[param_name]
+            local_loaded_weights = loaded_weights.redistribute(device_mesh=loaded_weights.device_mesh,
+                                                            placements=placement).to_local()
+        else:
+            local_loaded_weights = loaded_weights.full_tensor()
+    elif isinstance(loaded_weights, torch.Tensor):
+        param_name = _process_parameter_names(name=param_name)
+        if parallelize_plan is not None:
+            assert (
+                param_name
+                in parallelize_plan.keys()), f"param name: {param_name} not in parallelize_plan :{parallelize_plan.keys()}"
+            placement = parallelize_plan[param_name]
+            local_loaded_weights = torch.distributed.tensor.distribute_tensor(loaded_weights, 
+                                                                            device_mesh=loaded_weights.device_mesh,
+                                                                            placements=placement).to_local()
+        else:
+            local_loaded_weights = loaded_weights
     else:
-        local_loaded_weights = loaded_weights.full_tensor()
+        raise ValueError("Model weights should be Tensor")
     return local_loaded_weights
 
 

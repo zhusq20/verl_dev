@@ -326,6 +326,7 @@ class RayWorkerGroup(WorkerGroup):
         ranks = []
         if 'ranks' in kwargs:
             ranks.extend(kwargs['ranks'])
+            print(f"execute_rank_designated_async: method_name = {method_name}, ranks = {ranks}")
             del kwargs['ranks']
         if len(ranks) == 0:
             raise RuntimeError(
@@ -335,7 +336,7 @@ class RayWorkerGroup(WorkerGroup):
         length = len(ranks)
         # 这里我们假设，如果 args 和 kwargs 里面所有的参数都是 list，且所有的 list 长度都与 len(self._workers) 一致的话，我们会把
         # list 中的每一个分别发到对应的 worker 上去
-        # print(f"execute_all_async: method {method_name}({args}, {kwargs})")
+        # print(f"execute_rank_designated_async: method {method_name}({args}, {kwargs})")
         if all(isinstance(arg, list) for arg in args) and all(isinstance(kwarg, list) for kwarg in kwargs.values()):
             if all(len(arg) == length for arg in args) and all(len(kwarg) == length for kwarg in kwargs.values()):
                 result = []

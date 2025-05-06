@@ -35,6 +35,7 @@ class Dispatch(Enum):
     DP_COMPUTE_PROTO = 9
     DP_COMPUTE_PROTO_WITH_FUNC = 10
     DP_COMPUTE_METRIC = 11
+    TP_ONE_TO_ALL_DESIGNATED = 12
 
 
 class Execute(Enum):
@@ -298,21 +299,18 @@ def collect_dp_compute_data_proto(worker_group, output):
     return _concat_data_proto_or_future(output)
 
 
-def dispatch_dp_compute_data_proto_designated(worker_group, *args, **kwargs):
+def dispatch_one_to_all_designated(worker_group, *args, **kwargs):
     from verl.single_controller.base.worker_group import WorkerGroup
     assert isinstance(worker_group, WorkerGroup)
     ranks = []
     if 'ranks' in kwargs:
         ranks.extend(kwargs['ranks'])
-        del kwargs['ranks']
     if len(ranks) == 0:
         raise RuntimeError(
             "When using \'execute_rank_part\' as excution method "
             "\'ranks\' must be a valid parameter."
         )
-    splitted_args, splitted_kwargs = _split_args_kwargs_data_proto(len(ranks), *args, **kwargs)
-    splitted_kwargs['ranks'] = ranks
-    return splitted_args, splitted_kwargs
+    return args, kwargs
 
 
 def collect_dp_compute_designated(worker_group, output):
@@ -323,7 +321,7 @@ def collect_dp_compute_designated(worker_group, output):
     return output
 
 
-def collect_dp_compute_data_proto_designated(worker_group, output):
+def collect_tp_compute_data_proto_designated(worker_group, output):
     from verl.protocol import DataProto
     import ray
 
@@ -331,7 +329,7 @@ def collect_dp_compute_data_proto_designated(worker_group, output):
         assert isinstance(o, (DataProto, ray.ObjectRef)), f"expecting {o} to be DataProto, but got {type(o)}"
 
     output = collect_dp_compute_designated(worker_group, output)
-    return _concat_data_proto_or_future(output)
+    return output[0]
 
 
 def get_predefined_dispatch_fn(dispatch_mode):
@@ -380,9 +378,9 @@ def get_predefined_dispatch_fn(dispatch_mode):
             'dispatch_fn': dispatch_dp_compute_data_proto,
             'collect_fn': collect_dp_compute
         },
-        Dispathc.DP_COMPUTE_PROTO_DESIGNATED: {
-            'dispatch_fn': dispatch_dp_compute_data_proto_designated,
-            'collect_fn': collect_dp_compute_data_proto_designated
+        Dispatch.TP_ONE_TO_ALL_DESIGNATED: {
+            'dispatch_fn': dispatch_one_to_all_designated,
+            'collect_fn': collect_tp_compute_data_proto_designated
         }
     }
     return predefined_dispatch_mode_fn[dispatch_mode]

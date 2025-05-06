@@ -212,6 +212,9 @@ class SPMDGPUExecutor(ExecutorBase):
     def sync_model_weights(self, actor_weights: Dict[str, torch.Tensor], load_format: str) -> None:
         self.worker.sync_model_weights(actor_weights=actor_weights, load_format=load_format)
 
+    def load_model_weights(self, load_format: str) -> None:
+        self.worker.load_model_weights(load_format=load_format)
+
 
 def initialize_cluster(
     parallel_config: ParallelConfig,

@@ -284,11 +284,22 @@ class Worker(Worker):
         if self.cpu_model == None:
             self.cpu_model = {}
             for name, params in self.model_runner.model.named_parameters():
-                self.cpu_model[name] = torch.empty_like(params, device="cpu")
-                params.data = self.cpu_model[name]
+                self.cpu_model[name] = params.cpu()
+                params.data = torch.empty_like(self.cpu_model[name], device="cpu")
         else:
             for name, params in self.model_runner.model.named_parameters():
-                params.data = self.cpu_model[name]
+                self.cpu_model[name] = params.cpu()
+                params.data = torch.empty_like(self.cpu_model[name], device="cpu")
+                
+    def load_model_weights(self, load_format: str) -> None:
+        if self.cpu_model == None:
+            raise RuntimeError(
+                'Cpu do not have model weights.'
+            )
+        else:
+            for name, params in self.model_runner.model.named_parameters():
+                params.data = self.cpu_model[name].cuda()
+                self.cpu_model[name] = torch.empty_like(params, device="cpu")
 
 
 def init_worker_distributed_environment(

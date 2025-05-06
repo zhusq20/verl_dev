@@ -25,7 +25,7 @@ conda activate verl_dev
 export HYDRA_FULL_ERROR=1
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
-python3 -m verl.trainer.main_ppo \
+python3 -m verl.trainer.main_ppo_offline \
     data.train_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/countdown/train.parquet \
     data.val_files=/shared_ssd_storage/ziyiqiu/programs/verl_dev/data/countdown/test.parquet \
     data.train_batch_size=128 \
@@ -53,10 +53,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
     trainer.project_name='verl_offline_countdown_0.5B' \
-    trainer.experiment_name='qwen2.5_0.5B_ppo_online' \
+    trainer.experiment_name='qwen2.5_0.5B_ppo_offline' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=1000 \
     trainer.test_freq=5 \
-    trainer.fuse_enable=True \
+    trainer.fuse_enable=False \
     trainer.total_epochs=15 $@ >> output.txt
