@@ -20,7 +20,7 @@ else
     fi
 fi
 unset __conda_setup
-conda activate verl_dev
+conda activate test
 
 export HYDRA_FULL_ERROR=1
 export VLLM_ATTENTION_BACKEND=XFORMERS

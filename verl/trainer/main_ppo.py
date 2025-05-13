@@ -68,11 +68,40 @@ def main_task(config, compute_score=None):
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
     role_worker_mapping = {
+        # Role.ActorFuse: ray.remote(ActorRolloutRefWorker),
+        # Role.RolloutFuse: ray.remote(ActorRolloutRefWorker),
+        # Role.CriticFuse: ray.remote(CriticWorker),
+        # Role.RefPolicyFuse: ray.remote(ActorRolloutRefWorker),
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
         Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
     }
 
+    # if config.trainer.fuse_enable:
+    #     global_pool_id = 'global_pool'
+    #     rollout_fuse_id = 'rollout_fuse'
+    #     inference_fuse_id = 'inference_fuse'
+        
+    #     n_gpus = config.trainer.n_gpus_per_node
+    #     rollout_tp_size = config.actor_rollout_ref.rollout.tensor_model_parallel_size
+    #     assert n_gpus - rollout_tp_size > 0, "When setting fuse_enable, n_gpus_per_node must be greater than tensor_model_parallel_size."
+        
+    #     resource_pool_spec = {
+    #         global_pool_id: [n_gpus] * config.trainer.nnodes,
+    #         rollout_fuse_id: [rollout_tp_size] * config.trainer.nnodes,
+    #         inference_fuse_id: [n_gpus - rollout_tp_size] * config.trainer.nnodes,
+    #     }
+    #     mapping = {
+    #         Role.ActorFuse: inference_fuse_id,
+    #         Role.RolloutFuse: rollout_fuse_id,
+    #         Role.CriticFuse: inference_fuse_id,
+    #         Role.RefPolicyFuse: inference_fuse_id,
+    #         Role.RewardModelFuse: inference_fuse_id,
+    #         Role.ActorRollout: global_pool_id,
+    #         Role.Critic: global_pool_id,
+    #         Role.RefPolicy: global_pool_id,
+    #     }
+    # else:
     global_pool_id = 'global_pool'
     resource_pool_spec = {
         global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
@@ -96,6 +125,7 @@ def main_task(config, compute_score=None):
             from verl.workers.megatron_workers import RewardModelWorker
         else:
             raise NotImplementedError
+        # role_worker_mapping[Role.RewardModelFuse] = ray.remote(RewardModelWorker)
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 

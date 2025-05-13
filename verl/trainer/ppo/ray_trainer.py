@@ -55,6 +55,11 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
+    ActorFuse = 7
+    RolloutFuse = 8
+    CriticFuse = 9
+    RefPolicyFuse = 10
+    RewardModelFuse = 11
 
 
 @dataclass
@@ -66,6 +71,9 @@ class ResourcePoolManager:
     resource_pool_spec: dict[str, list[int]]
     mapping: dict[Role, str]
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+    
+    def get(self, name: str) -> RayResourcePool:
+        return self.resource_pool_dict[name]
 
     def create_resource_pool(self):
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
@@ -675,6 +683,10 @@ class RayPPOTrainer(object):
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
+            # if self.config.trainer.fuse_enable:
+            #     resource_pool = self.resource_pool_manager.get_resource_pool(Role.CriticFuse)
+            #     critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.CriticFuse], config=self.config.critic)
+            #     self.resource_pool_to_cls[resource_pool]['critic_fuse'] = critic_cls
 
         # create reference policy if needed
         if self.use_reference_policy:
@@ -720,6 +732,14 @@ class RayPPOTrainer(object):
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
+        
+        rollout_tp_size = int(self.config.actor_rollout_ref.rollout.tensor_model_parallel_size)
+        world_size = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
+        self.inference_ranks = [idx for idx in range(world_size - rollout_tp_size)]
+        if self.config.trainer.fuse_enable:
+            self.actor_rollout_wg.init_fuse_model(ranks=self.inference_ranks)
+            
+        print("init workers done !!")
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -960,27 +980,35 @@ class RayPPOTrainer(object):
                         _ = gen_fuse_buffer.non_tensor_batch.pop("seq_finished") # pop this element in batch to avoid concat bugs
                         fuse_buffer = fuse_buffer.union(gen_fuse_buffer)
                         
-                        rollout_tp_size = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
-                        gen_ranks = [i for i in range(rollout_tp_size)]
+                        # TODO: sync model weights!
+                        actor_model_weights = self.actor_rollout_wg.get_actor_model_weights()
                         with _timer('gen_overlap', timing_raw):
-                            fused_batch = self.actor_rollout_wg.generate_sequences_fused(prompts=fuse_buffer, ranks=gen_ranks)
+                            self.rollout_wg_fuse.sync_rollout_model_weights(actor_model_weights)
+                            gen_fused_ref = self.rollout_wg_fuse.generate_sequences_offline(prompts=fuse_buffer)
                         
                         overlapped_response_info = _compute_response_info(batch)
                         overlapped_prompt_length = overlapped_response_info['prompt_length']
                         overlapped_response_length = overlapped_response_info['response_length']
-                        
-                        total_size = self.config.trainer.n_gpus_per_node
-                        inference_ranks = [i for i in range(rollout_tp_size, total_size)]
-                        if self.use_reference_policy and len(inference_ranks) > 0:
+
+                        with _timer('old_log_prob_overlap', timing_raw):
+                            self.actor_rollout_wg.sync_actor_model_weights(actor_model_weights)
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            batch = batch.union(old_log_prob)
+                        if self.use_reference_policy:
                             # compute reference log_prob
                             with _timer('ref_overlap', timing_raw):
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob_fused(data=batch, ranks=inference_ranks)
+                                ref_log_prob = self.ref_policy_wg_fuse.compute_ref_log_prob(data=batch)
                                 batch = batch.union(ref_log_prob)
-                        if self.use_critic and len(inference_ranks) > 0:
+                        if self.use_critic:
                             with _timer('values_overlap', timing_raw):
-                                values = self.critic_wg.compute_values_fused(data=batch, ranks=inference_ranks)
+                                critic_model_weights = self.critic_wg.get_critic_model_weights()
+                                self.critic_wg_fuse.sync_critic_model_weights(critic_model_weights)
+                                values = self.critic_wg_fuse.compute_values(data=batch)
                                 batch = batch.union(values)
-                            
+                        if self.use_rm:
+                            with _timer('reward_overlap', timing_raw):
+                                reward_tensor = self.rm_wg_fuse.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
                         # TODO: check if n != 1, the group have unfinished responses
                         seq_finished = gen_replay_buffer.non_tensor_batch.pop("seq_finished")
                         if self.config.actor_rollout_ref.rollout.n > 1:
@@ -1019,7 +1047,7 @@ class RayPPOTrainer(object):
                             fused_batch = DataProto.concat([fuse_finished, replay_finished.union(gen_replay_finished)]) 
                             
                         overlapped_batch = batch
-                        batch = fused_batch
+                        batch = ray.get(gen_fused_ref)
                     
                     response_info = _compute_response_info(batch)
                     prompt_length = response_info['prompt_length']

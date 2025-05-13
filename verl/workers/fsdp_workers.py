@@ -57,6 +57,18 @@ def create_device_mesh(world_size, fsdp_size):
                                        mesh_dim_names=['ddp', 'fsdp'])
     return device_mesh
 
+def create_fuse_fsdp_device_mesh(world_size, fsdp_size, group):
+    if fsdp_size < 0 or fsdp_size >= world_size:
+        import torch.distributed.device_mesh
+        device_mesh = torch.distributed.device_mesh.DeviceMesh.from_group(group=group,
+                                                                          device_type='cuda', 
+                                                                          mesh_dim_names=['fsdp'])
+    else:
+        raise ValueError(
+            'HSDP is not supported yet because it produces incorrect results for now. Please set fsdp_size=-1')
+    return device_mesh
+
+        
 
 def get_sharding_strategy(device_mesh):
     from torch.distributed.fsdp import ShardingStrategy
@@ -84,6 +96,7 @@ class ActorRolloutRefWorker(Worker):
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
+        self._train_world_size = world_size
         # TODO(sgm): support FSDP hybrid shard for larger model
         self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
 
@@ -136,6 +149,11 @@ class ActorRolloutRefWorker(Worker):
             self.config.ref.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
                                                            self.ulysses_sequence_parallel_size)
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+            
+        # with fuse enable
+        self._is_create_fuse_model = False
+        
+        print(f"fsdp_worker world size {world_size} init")
 
     def _build_model_optimizer(self,
                                model_path,
@@ -239,7 +257,7 @@ class ActorRolloutRefWorker(Worker):
 
         print(f'wrap_policy: {auto_wrap_policy}')
 
-        fsdp_mesh = self.device_mesh
+        fsdp_mesh = self.device_mesh if not self._is_create_fuse_model else self.device_mesh_fuse
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
         # TODO: add transformer policy
@@ -256,7 +274,7 @@ class ActorRolloutRefWorker(Worker):
             sharding_strategy=sharding_strategy,  # zero3
             mixed_precision=mixed_precision,
             sync_module_states=True,
-            device_mesh=self.device_mesh,
+            device_mesh=fsdp_mesh,
             forward_prefetch=False)
 
         log_gpu_memory_usage('After Actor FSDP init', logger=logger)
@@ -407,6 +425,63 @@ class ActorRolloutRefWorker(Worker):
             local_path = copy_local_path_from_hdfs(self.config.model.path)
             ref_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=True)
             self.flops_counter = FlopsCounter(ref_model_config)
+        torch.cuda.empty_cache()
+        global_rank = torch.distributed.get_rank()
+        print(f"rank {self.rank}; global rank {global_rank} init_model done.")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_fuse_model(self, ranks=None):
+        global_rank = torch.distributed.get_rank()
+        print(f"rank {self.rank}; global rank {global_rank} init fsdp_fuse_pg")
+        self.fsdp_fuse_pg = torch.distributed.split_group(split_ranks=[ranks])
+        print(f"rank {self.rank}; global rank {global_rank} split_group")
+        torch.distributed.barrier()
+
+        if not self.rank in ranks:
+            return
+        self._is_create_fuse_model = True
+        self.device_mesh_fuse = create_fuse_fsdp_device_mesh(world_size=self._train_world_size-self.config.rollout.tensor_model_parallel_size,
+                                                             fsdp_size=self.config.actor.fsdp_config.fsdp_size,
+                                                             group=self.fsdp_fuse_pg)
+        
+        from verl.workers.actor import DataParallelPPOActor
+        from omegaconf import OmegaConf
+        override_model_config = OmegaConf.to_container(self.config.model.get('override_config', OmegaConf.create()))
+
+        use_remove_padding = self.config.model.get('use_remove_padding', False)
+
+        if self._is_actor or self._is_rollout:
+            # we need the model for actor and rollout
+            if self._is_actor:
+                optim_config = self.config.actor.optim
+                fsdp_config = self.config.actor.fsdp_config
+            else:
+                optim_config = None
+                fsdp_config = OmegaConf.create()
+            self.actor_module_fsdp_fuse, self.actor_optimizer_fuse, self.actor_lr_scheduler_fuse, self.actor_model_config_fuse = self._build_model_optimizer(
+                model_path=self.config.model.path,
+                fsdp_config=fsdp_config,
+                optim_config=optim_config,
+                override_model_config=override_model_config,
+                use_remove_padding=use_remove_padding,
+                enable_gradient_checkpointing=self.config.model.get('enable_gradient_checkpointing', False),
+                trust_remote_code=self.config.model.get('trust_remote_code', False),
+                use_liger=self.config.model.get('use_liger', False),
+                role='actor')
+
+            if self._is_offload_param:
+                # param is require during state_dict in sharding manager
+                offload_fsdp_grad(module=self.actor_module_fsdp_fuse)
+                log_gpu_memory_usage('After offload actor grad during init', logger=logger)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer_fuse)
+                log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
+        
+        if self._is_actor:
+            self.actor_fuse = DataParallelPPOActor(config=self.config.actor,
+                                              actor_module=self.actor_module_fsdp_fuse,
+                                              actor_optimizer=self.actor_optimizer_fuse)
+            
         torch.cuda.empty_cache()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -633,7 +708,7 @@ class ActorRolloutRefWorker(Worker):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.actor.compute_log_prob(data=data)
+            output = self.actor_fused.compute_log_prob(data=data)
             output = DataProto.from_dict(tensors={'old_log_probs': output},
                                          meta_info={'temperature': self.config.rollout.temperature})
             output = self.ulysses_sharding_manager.postprocess_data(output)
@@ -694,7 +769,7 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.ref_policy.compute_log_prob(data=data)
+            output = self.ref_policy_fused.compute_log_prob(data=data)
             output = DataProto.from_dict(tensors={'ref_log_prob': output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
@@ -703,7 +778,7 @@ class ActorRolloutRefWorker(Worker):
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
         if self.world_size > 1:
-            self.ref_policy.actor_module._handle.reshard(True)
+            self.ref_policy_fused.actor_module._handle.reshard(True)
 
         torch.cuda.empty_cache()
         return output
@@ -758,15 +833,11 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def sync_rollout_model_weights(self, model_weights: dict):
-        # from torch.distributed.tensor import distribute_tensor, Shard, Replicate
-        # from collections import OrderedDict
-
-        # local_model_weights = OrderedDict()
-        # for k, v in model_weights.items():
-        #     local_v = distribute_tensor(v, self.device_mesh, [Replicate(), Shard(dim=0)])
-        #     local_model_weights[k] = local_v.to(torch.cuda.current_device())
-
         self.rollout_sharding_manager.sync_rollout_model_weights(model_weights)
+        
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sync_actor_model_weights(self, model_weights: dict):
+        self.actor_module_fsdp.load(model_weights)
         
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_actor_model_weights(self):
@@ -791,6 +862,38 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
             
         return model_state_dict
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_ref_model_weights(self):
+        # only support actor
+        assert self._is_actor
+        import torch
+        from torch.distributed._tensor import DTensor
+        
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+
+        model_state_dict = self.ref_module_fsdp.state_dict()
+        for k, v in model_state_dict.items():
+            if isinstance(v, DTensor):
+                v = v.full_tensor()
+                model_state_dict[k] = v.cpu()
+
+        torch.distributed.barrier()
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+            
+        return model_state_dict
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sync_actor_model_weights_fused(self, model_weights: dict):
+        self.rollout_sharding_mnaager.sync_rollout_model_weights(model_weights)
+        
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sync_ref_model_weights_fused(self, model_weights: dict):
+        self.rollout_sharding_mnaager.sync_rollout_model_weights(model_weights)
 
 class CriticWorker(Worker):
 
@@ -929,7 +1032,7 @@ class CriticWorker(Worker):
                              mixed_precision=mixed_precision,
                              sync_module_states=True,
                              forward_prefetch=False,
-                             device_mesh=self.device_mesh,
+                             device_mesh=fsdp_mesh,
                              cpu_offload=None)
 
         log_gpu_memory_usage('After critic FSDP', logger=None)
@@ -1100,6 +1203,30 @@ class CriticWorker(Worker):
         a,b,c= self.flops_counter.estimate_flops_critic(prompt_length, response_length, delta_time)
         return a, b, c
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_critic_model_weights(self):
+        import torch
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(module=self.critic_module,
+                                     device_id=torch.cuda.current_device(),
+                                     load_grad=self._is_offload_grad)
+
+        model_state_dict = self.critic_module.state_dict()
+        for k, v in model_state_dict.items():
+            if isinstance(v, DTensor):
+                v = v.full_tensor()
+                model_state_dict[k] = v.cpu()
+
+        torch.distributed.barrier()
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
+            
+        return model_state_dict
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sync_critic_model_weights(self, model_weights: dict):
+        self.critic_module.load(model_weights)
+
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py
 class RewardModelWorker(Worker):
@@ -1195,7 +1322,7 @@ class RewardModelWorker(Worker):
             sync_module_states=True,
             cpu_offload=CPUOffload(offload_params=True),
             forward_prefetch=False,
-            device_mesh=self.device_mesh)
+            device_mesh=fsdp_mesh)
 
         return reward_module
 

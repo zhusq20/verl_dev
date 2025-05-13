@@ -1131,17 +1131,17 @@ class RayPPOTrainer(object):
 
                 if self.global_steps >= self.total_training_steps:
                     print(f"TOTAL TIME: {time.time()-begin_timestamp:.4f} s")
+
+                    # perform validation after training
+                    if self.val_reward_fn is not None:
+                        val_metrics = self._validate()
+                        pprint(f'Final validation metrics: {val_metrics}')
+                        logger.log(data=val_metrics, step=self.global_steps)
+                    if self.config.trainer.save_freq > 0 and \
+                            (self.global_steps - 1) % self.config.trainer.save_freq != 0:
+                        with _timer('save_checkpoint', timing_raw):
+                            self._save_checkpoint()
                     return
-                #     # perform validation after training
-                #     if self.val_reward_fn is not None:
-                #         val_metrics = self._validate()
-                #         pprint(f'Final validation metrics: {val_metrics}')
-                #         logger.log(data=val_metrics, step=self.global_steps)
-                #     if self.config.trainer.save_freq > 0 and \
-                #             (self.global_steps - 1) % self.config.trainer.save_freq != 0:
-                #         with _timer('save_checkpoint', timing_raw):
-                #             self._save_checkpoint()
-                #     return
             
             new_loop.stop()
             # cancel uncompleted generation tasks
@@ -1161,5 +1161,3 @@ class RayPPOTrainer(object):
             gen_obj_ref_list.clear()
             metrics_list.clear()
             timing_raw_list.clear()
-
-        print(f"TOTAL TIME: {time.time()-begin_timestamp:.4f} s")
